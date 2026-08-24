@@ -800,8 +800,10 @@ enum PlanCoordinator {
 
     /// Publish the current plan to every downstream consumer.
     static func publishChange(context: ModelContext, interactive: Bool = true) {
-        CalendarExportService.syncIfEnabled(context: context)
-        GoogleCalendarService.exportIfEnabled(context: context)
+        if FilumaProAccess.isPro {
+            CalendarExportService.syncIfEnabled(context: context)
+            GoogleCalendarService.exportIfEnabled(context: context)
+        }
         scheduleDidChange(context: context, interactive: interactive)
     }
 
@@ -1771,15 +1773,17 @@ enum PlanCoordinator {
                     context.delete(session)
                 }
 
-                materializedTasks = SchedulerService.materializeRecurringTasks(
-                    templates: templates,
-                    allBlocks: allBlocks.filter { $0.task != nil },
-                    blockedTimes: blockedTimes,
-                    busyEvents: busyEvents,
-                    settings: settings,
-                    now: now,
-                    context: context
-                )
+                if FilumaProAccess.isPro {
+                    materializedTasks = SchedulerService.materializeRecurringTasks(
+                        templates: templates,
+                        allBlocks: allBlocks.filter { $0.task != nil },
+                        blockedTimes: blockedTimes,
+                        busyEvents: busyEvents,
+                        settings: settings,
+                        now: now,
+                        context: context
+                    )
+                }
                 context.processPendingChanges()
 
                 if canRewriteSchedule {

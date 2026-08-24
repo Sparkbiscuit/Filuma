@@ -11,6 +11,7 @@ struct BulkEntryView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(FilumaProStore.self) private var proStore
 
     /// Called after the user has seen the durable summary and wants to return
     /// to Tasks. CaptureSheetView uses the receipt for the same app-level handoff
@@ -24,6 +25,7 @@ struct BulkEntryView: View {
     @State private var showDiscardConfirmation = false
     @State private var isDirty = false
     @State private var pendingRowFocusID: UUID?
+    @State private var showingPaywallFeature: ProFeature?
     @FocusState private var focusedRowID: UUID?
     @AccessibilityFocusState private var accessibilityFocusedRowID: UUID?
     @AccessibilityFocusState private var issueFocused: Bool
@@ -92,6 +94,9 @@ struct BulkEntryView: View {
             Button("Keep Editing", role: .cancel) { }
         } message: {
             Text("The tasks in this batch have not been saved yet.")
+        }
+        .sheet(item: $showingPaywallFeature) { feature in
+            FilumaPaywallView(feature: feature)
         }
         // Once the batch is durable, the fixed Review action is the one exit so
         // the app-level Tasks handoff cannot be skipped by a sheet drag.
@@ -263,6 +268,24 @@ struct BulkEntryView: View {
 
     private func scheduleAll() {
         guard !validRows.isEmpty, !isSubmitting else { return }
+        let activeTaskCount: Int
+        do {
+            activeTaskCount = try modelContext.fetchCount(FetchDescriptor<FilumaTask>(
+                predicate: #Predicate { !$0.isComplete }
+            ))
+        } catch {
+            issue = "Filuma couldn't check your active tasks yet. Every row is still here—try again."
+            return
+        }
+        guard SubscriptionPolicy.canAddTasks(
+            activeTaskCount: activeTaskCount,
+            requestedCount: validRows.count,
+            isPro: proStore.isPro
+        ) else {
+            focusedRowID = nil
+            showingPaywallFeature = .taskLimit
+            return
+        }
         focusedRowID = nil
         issueFocused = false
         issue = nil

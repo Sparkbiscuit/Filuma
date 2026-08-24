@@ -101,3 +101,43 @@ enum SharedStore {
         WidgetCenter.shared.reloadAllTimelines()
     }
 }
+
+/// A verified entitlement snapshot shared with extensions and App Intents.
+/// The main app refreshes this value from StoreKit's signed transaction
+/// sequence. Extensions use the last verified value because they cannot rely
+/// on a live StoreKit query during every timeline render.
+enum FilumaProAccess {
+    static let entitlementKey = "filuma.pro.current-entitlement"
+
+    private static var defaults: UserDefaults {
+        UserDefaults(suiteName: SharedStore.appGroupId) ?? .standard
+    }
+
+    static var isPro: Bool {
+        defaults.bool(forKey: entitlementKey)
+    }
+
+    static func setVerifiedEntitlement(_ isPro: Bool) {
+        guard defaults.bool(forKey: entitlementKey) != isPro else { return }
+        defaults.set(isPro, forKey: entitlementKey)
+        SharedStore.reloadWidgets()
+    }
+}
+
+enum SubscriptionPolicy {
+    static let freeActiveTaskLimit = 3
+
+    static func canAddTasks(
+        activeTaskCount: Int,
+        requestedCount: Int,
+        isPro: Bool
+    ) -> Bool {
+        guard requestedCount >= 0 else { return false }
+        return isPro || activeTaskCount + requestedCount <= freeActiveTaskLimit
+    }
+
+    static func remainingFreeTasks(activeTaskCount: Int, isPro: Bool) -> Int? {
+        guard !isPro else { return nil }
+        return max(0, freeActiveTaskLimit - activeTaskCount)
+    }
+}

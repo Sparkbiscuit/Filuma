@@ -74,6 +74,43 @@ final class FilumaTests: XCTestCase {
 
     // MARK: - User settings defaults
 
+    func testFreeTierAllowsExactlyThreeActiveTasks() {
+        XCTAssertTrue(SubscriptionPolicy.canAddTasks(
+            activeTaskCount: 2,
+            requestedCount: 1,
+            isPro: false
+        ))
+        XCTAssertFalse(SubscriptionPolicy.canAddTasks(
+            activeTaskCount: 3,
+            requestedCount: 1,
+            isPro: false
+        ))
+        XCTAssertFalse(SubscriptionPolicy.canAddTasks(
+            activeTaskCount: 2,
+            requestedCount: 2,
+            isPro: false
+        ))
+        XCTAssertTrue(SubscriptionPolicy.canAddTasks(
+            activeTaskCount: 500,
+            requestedCount: 20,
+            isPro: true
+        ))
+    }
+
+    func testFreeTierRemainingCountNeverGoesNegative() {
+        XCTAssertEqual(
+            SubscriptionPolicy.remainingFreeTasks(activeTaskCount: 1, isPro: false),
+            2
+        )
+        XCTAssertEqual(
+            SubscriptionPolicy.remainingFreeTasks(activeTaskCount: 3, isPro: false),
+            0
+        )
+        XCTAssertNil(
+            SubscriptionPolicy.remainingFreeTasks(activeTaskCount: 9, isPro: true)
+        )
+    }
+
     func testFreshUserSettingsUsesCanonicalSchedulingDefaults() {
         let defaults = UserSettingsSchedulingDefaults.fresh
 

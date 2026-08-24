@@ -10,6 +10,7 @@ enum WidgetStore {
 
 struct TodayEntry: TimelineEntry {
     let date: Date
+    let isPro: Bool
     let doneBlocks: Int
     let totalBlocks: Int
     let nextTitle: String?
@@ -24,6 +25,7 @@ struct TodayProvider: TimelineProvider {
     func placeholder(in context: Context) -> TodayEntry {
         TodayEntry(
             date: Date(),
+            isPro: true,
             doneBlocks: 1,
             totalBlocks: 3,
             nextTitle: "Finish lab report",
@@ -54,7 +56,8 @@ struct TodayProvider: TimelineProvider {
         guard let container = WidgetStore.container,
               let tomorrow = calendar.date(byAdding: .day, value: 1, to: today) else {
             return TodayEntry(
-                date: now, doneBlocks: 0, totalBlocks: 0,
+                date: now, isPro: FilumaProAccess.isPro,
+                doneBlocks: 0, totalBlocks: 0,
                 nextTitle: nil, nextStart: nil, nextTaskId: nil, streakDays: 0
             )
         }
@@ -92,6 +95,7 @@ struct TodayProvider: TimelineProvider {
 
         return TodayEntry(
             date: now,
+            isPro: FilumaProAccess.isPro,
             doneBlocks: done,
             totalBlocks: todayBlocks.count,
             nextTitle: next?.task?.title,
@@ -125,13 +129,17 @@ private struct TodayWidgetView: View {
     let entry: TodayEntry
 
     var body: some View {
-        switch family {
-        case .accessoryCircular:
-            circularView
-        case .accessoryInline:
-            inlineView
-        default:
-            smallView
+        if entry.isPro {
+            switch family {
+            case .accessoryCircular:
+                circularView
+            case .accessoryInline:
+                inlineView
+            default:
+                smallView
+            }
+        } else {
+            ProWidgetGate(family: family)
         }
     }
 
@@ -269,6 +277,56 @@ private struct TodayWidgetView: View {
         .widgetURL(deepLink)
         .containerBackground(for: .widget) {
             HearthWidgetBackground()
+        }
+    }
+}
+
+struct ProWidgetGate: View {
+    let family: WidgetFamily
+
+    private let upgradeURL = URL(string: "filuma://upgrade")!
+
+    var body: some View {
+        Group {
+            switch family {
+            case .accessoryInline:
+                Text("Filuma Pro: unlock widgets")
+            case .accessoryCircular:
+                ZStack {
+                    AccessoryWidgetBackground()
+                    Image(systemName: "flame.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                }
+            case .accessoryRectangular:
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("FILUMA PRO")
+                        .font(AppFont.caption(9))
+                    Text("Unlock your plan at a glance")
+                        .font(AppFont.bodySemibold(13))
+                }
+            default:
+                VStack(alignment: .leading, spacing: 8) {
+                    Image(systemName: "flame.fill")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(Color.brand300)
+                    Text("Filuma Pro")
+                        .font(AppFont.heading(16))
+                        .foregroundStyle(Color.filumaText)
+                    Text("Unlock your plan at a glance.")
+                        .font(AppFont.body(12))
+                        .foregroundStyle(Color.filumaSubtle)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .environment(\.colorScheme, .dark)
+            }
+        }
+        .widgetURL(upgradeURL)
+        .containerBackground(for: .widget) {
+            if family == .systemSmall || family == .systemMedium {
+                HearthWidgetBackground()
+            } else {
+                Color.clear
+            }
         }
     }
 }

@@ -486,6 +486,32 @@ final class FilumaUITests: XCTestCase {
         )
     }
 
+    func testFreeTierBulkCaptureStopsAtThreeActiveTasks() throws {
+        let app = launchApp(
+            skipOnboarding: true,
+            seedFreeBoundary: true,
+            freeTier: true
+        )
+        openBulkCapture(in: app)
+
+        let firstTitleField = app.textFields["bulk.row.1.title"]
+        assertVisible(firstTitleField)
+        firstTitleField.tap()
+        firstTitleField.typeText("A third thread")
+
+        app.buttons["bulk.addRow"].tap()
+        let secondTitleField = app.textFields["bulk.row.2.title"]
+        assertVisible(secondTitleField)
+        secondTitleField.tap()
+        secondTitleField.typeText("One over the free limit")
+
+        app.buttons["bulk.scheduleAll"].tap()
+
+        assertVisible(app.descendants(matching: .any)["pro.paywall"])
+        assertVisible(app.buttons["pro.paywall.close"])
+        XCTAssertFalse(app.descendants(matching: .any)["bulk.success"].exists)
+    }
+
     func testBulkControlsRemainReachableAtAccessibility5() throws {
         let app = launchApp(skipOnboarding: true, accessibilityText: true)
         openBulkCapture(in: app)
@@ -2422,8 +2448,10 @@ final class FilumaUITests: XCTestCase {
         accessibilityText: Bool = false,
         seedCompletion: Bool = false,
         seedLibrary: Bool = false,
+        seedFreeBoundary: Bool = false,
         seedSchedule: Bool = false,
-        seedOverdue: Bool = false
+        seedOverdue: Bool = false,
+        freeTier: Bool = false
     ) -> XCUIApplication {
         let app = XCUIApplication()
         app.launchArguments = ["-ui-testing"]
@@ -2439,11 +2467,17 @@ final class FilumaUITests: XCTestCase {
         if seedLibrary {
             app.launchArguments.append("-ui-testing-seed-library")
         }
+        if seedFreeBoundary {
+            app.launchArguments.append("-ui-testing-seed-free-boundary")
+        }
         if seedSchedule {
             app.launchArguments.append("-ui-testing-seed-schedule")
         }
         if seedOverdue {
             app.launchArguments.append("-ui-testing-seed-overdue")
+        }
+        if freeTier {
+            app.launchArguments.append("-ui-testing-free")
         }
         app.launch()
         return app

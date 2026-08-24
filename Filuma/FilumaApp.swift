@@ -84,6 +84,7 @@ struct FilumaApp: App {
     private static let uiTestingAccessibilityTextArgument = "-ui-testing-accessibility-text"
     private static let uiTestingSeedCompletionArgument = "-ui-testing-seed-completion"
     private static let uiTestingSeedLibraryArgument = "-ui-testing-seed-library"
+    private static let uiTestingSeedFreeBoundaryArgument = "-ui-testing-seed-free-boundary"
     private static let uiTestingSeedScheduleArgument = "-ui-testing-seed-schedule"
     private static let uiTestingSeedOverdueArgument = "-ui-testing-seed-overdue"
 
@@ -92,12 +93,14 @@ struct FilumaApp: App {
     private let container: ModelContainer
     private let usedFallback: Bool
     @State private var showingPersistenceWarning: Bool
+    @State private var proStore: FilumaProStore
 
     init() {
         let setup = Self.makeContainer()
         container = setup.container
         usedFallback = setup.usedFallback
         _showingPersistenceWarning = State(initialValue: setup.usedFallback)
+        _proStore = State(initialValue: FilumaProStore())
     }
 
     private static func makeContainer() -> (container: ModelContainer, usedFallback: Bool) {
@@ -153,6 +156,9 @@ struct FilumaApp: App {
             let shouldSeedLibrary = CommandLine.arguments.contains(
                 uiTestingSeedLibraryArgument
             )
+            let shouldSeedFreeBoundary = CommandLine.arguments.contains(
+                uiTestingSeedFreeBoundaryArgument
+            )
             let shouldSeedSchedule = CommandLine.arguments.contains(
                 uiTestingSeedScheduleArgument
             )
@@ -162,6 +168,7 @@ struct FilumaApp: App {
             if shouldSkipOnboarding
                 || shouldSeedCompletion
                 || shouldSeedLibrary
+                || shouldSeedFreeBoundary
                 || shouldSeedSchedule
                 || shouldSeedOverdue {
                 let context = ModelContext(container)
@@ -184,6 +191,8 @@ struct FilumaApp: App {
                         startedAt: Date().addingTimeInterval(-25 * 60),
                         durationSeconds: 25 * 60
                     ))
+                } else if shouldSeedFreeBoundary {
+                    insertFreeTierBoundaryFixture(in: context)
                 } else if shouldSeedLibrary {
                     insertLibraryFixture(in: context)
                 } else if shouldSeedSchedule {
@@ -235,6 +244,26 @@ struct FilumaApp: App {
         completed.isComplete = true
         completed.completedAt = now.addingTimeInterval(-3 * 3600)
         context.insert(completed)
+    }
+
+    /// Two active tasks leave exactly one free slot, so the bulk-capture UI
+    /// test can exercise the three-task boundary without coupling to Library.
+    private static func insertFreeTierBoundaryFixture(in context: ModelContext) {
+        let now = Date()
+        context.insert(FilumaTask(
+            title: "Review launch checklist",
+            context: .work,
+            deadline: now.addingTimeInterval(48 * 3600),
+            effortMinutes: 45,
+            firstStep: "Open the release checklist"
+        ))
+        context.insert(FilumaTask(
+            title: "Pick up prescription",
+            context: .personal,
+            deadline: now.addingTimeInterval(72 * 3600),
+            effortMinutes: 30,
+            firstStep: "Check the pharmacy hours"
+        ))
     }
 
     /// Calendar-only fixtures exercise the week surface without asking the
@@ -326,6 +355,7 @@ struct FilumaApp: App {
     var body: some Scene {
         WindowGroup {
             rootView
+                .environment(proStore)
                 .alert("Your data needs a breather", isPresented: $showingPersistenceWarning) {
                     Button("Got it", role: .cancel) {}
                 } message: {
@@ -361,6 +391,7 @@ struct MainTabView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(FilumaProStore.self) private var proStore
     @Query private var settingsArray: [UserSettings]
     // `endTime` is computed, so SwiftData cannot use it in a fetch sort. The
     // lightweight policy below computes the minimum from this unsorted set.
@@ -375,6 +406,7 @@ struct MainTabView: View {
     @State private var lastReplanAnnouncementDate: Date?
     @State private var hasBootstrappedSettings = false
     @State private var bootstrapIssue: String?
+    @State private var showingPaywallFeature: ProFeature?
 
     private var catchUpRefreshTrigger: CatchUpRefreshTrigger {
         CatchUpRefreshTrigger(
@@ -399,13 +431,31 @@ struct MainTabView: View {
                 onBulkCaptured: { _ in selectTab(0) }
             )
         }
+        .sheet(item: $showingPaywallFeature) { feature in
+            FilumaPaywallView(feature: feature)
+        }
         .onAppear {
             bootstrap()
             consumePendingSessionRequest()
         }
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
+                Task { await proStore.refreshEntitlements() }
                 refreshSchedule()
+            }
+        }
+        .onChange(of: proStore.entitlementState) { _, newState in
+            switch newState {
+            case .pro:
+                // A fresh install can finish StoreKit verification after the
+                // initial bootstrap. Run the Pro-only imports, recurrence,
+                // and publishing immediately instead of waiting for the next
+                // foreground transition.
+                refreshSchedule()
+            case .free:
+                reconcileSubscriptionState()
+            case .checking:
+                break
             }
         }
         // A single cancellable wake-up at the next block boundary keeps an
@@ -493,7 +543,13 @@ struct MainTabView: View {
             case 1:
                 ScheduleView()
             case 2:
-                WeaveView()
+                if proStore.isPro {
+                    WeaveView()
+                } else {
+                    ProLockedFeatureView(feature: .weave) {
+                        showingPaywallFeature = .weave
+                    }
+                }
             default:
                 SettingsView()
             }
@@ -517,6 +573,8 @@ struct MainTabView: View {
            let idString = url.pathComponents.dropFirst().first,
            let taskId = UUID(uuidString: idString) {
             requestWorkSession(for: taskId)
+        } else if url.host == "upgrade" {
+            showingPaywallFeature = .general
         } else {
             selectTab(0)
         }
@@ -618,16 +676,21 @@ struct MainTabView: View {
         }
 
         refreshSchedule()
+        reconcileSubscriptionState()
     }
 
     /// Foreground refresh: pull fresh calendar busy times, stamp out any due
     /// recurring tasks, replan missed blocks around everything, then mirror
     /// only a durably committed result back out.
     private func refreshSchedule() {
-        CalendarImportService.syncIfEnabled(context: modelContext)
-        // Google runs async off the same hook; when its import lands changes
-        // it replans on its own, mirroring the busy-change path below.
-        GoogleCalendarService.foregroundSyncIfEnabled(context: modelContext)
+        if proStore.entitlementState == .pro {
+            CalendarImportService.syncIfEnabled(context: modelContext)
+            // Google runs async off the same hook; when its import lands
+            // changes it replans on its own.
+            GoogleCalendarService.foregroundSyncIfEnabled(context: modelContext)
+        } else if proStore.entitlementState == .free {
+            reconcileSubscriptionState()
+        }
         do {
             // The coordinator owns orphan repair, recurrence materialization,
             // catch-up, conflict repair, one save, and one post-commit publish.
@@ -643,6 +706,16 @@ struct MainTabView: View {
         } catch {
             // Foreground maintenance retries on the next activation. Silence is
             // truthful here: no plan was committed, published, or announced.
+        }
+    }
+
+    private func reconcileSubscriptionState() {
+        guard proStore.entitlementState == .free else { return }
+        do {
+            try ProFeatureSuspension.reconcileFreeTier(in: modelContext)
+        } catch {
+            // The app retries at the next foreground activation. Existing
+            // authored tasks and remote calendar events remain untouched.
         }
     }
 

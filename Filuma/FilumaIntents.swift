@@ -30,6 +30,19 @@ struct CaptureTaskIntent: AppIntent {
 
         let container = try SharedStore.makeContainer()
         let context = ModelContext(container)
+        let activeDescriptor = FetchDescriptor<FilumaTask>(
+            predicate: #Predicate { !$0.isComplete }
+        )
+        let activeTaskCount = try context.fetchCount(activeDescriptor)
+        guard SubscriptionPolicy.canAddTasks(
+            activeTaskCount: activeTaskCount,
+            requestedCount: 1,
+            isPro: FilumaProAccess.isPro
+        ) else {
+            return .result(
+                dialog: "Your three free active tasks are already in motion. Open Filuma to finish one or unlock Pro before capturing another."
+            )
+        }
         let now = Date()
         let deadline = Calendar.current.date(
             byAdding: .day,

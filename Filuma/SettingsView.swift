@@ -33,6 +33,7 @@ struct SettingsView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(FilumaProStore.self) private var proStore
     @Query private var settingsArray: [UserSettings]
     @State private var showCalendarDeniedAlert = false
     @State private var showNotificationsDeniedAlert = false
@@ -54,6 +55,7 @@ struct SettingsView: View {
     @State private var calendarSettingRetry: CalendarSettingRetry?
     @State private var notificationSettingIssue: BlockNotificationService.PreferenceUpdate?
     @State private var appleExportRequestID: UUID?
+    @State private var showingPaywallFeature: ProFeature?
 
     var body: some View {
         NavigationStack {
@@ -73,6 +75,9 @@ struct SettingsView: View {
             guard oldPhase == .active, newPhase != .active else { return }
             flushPlanningRebuild()
         }
+        .sheet(item: $showingPaywallFeature) { feature in
+            FilumaPaywallView(feature: feature)
+        }
     }
 
     private func settingsList(_ settings: UserSettings) -> some View {
@@ -81,11 +86,31 @@ struct SettingsView: View {
                 settingsHeader
 
                 hearthSection
+                proSection
                 dailyScheduleSection(settings)
-                planningSection(settings)
+                if proStore.isPro {
+                    planningSection(settings)
+                } else {
+                    lockedSettingsSection(
+                        title: "Planning",
+                        feature: .planning,
+                        label: "Advanced planning controls"
+                    )
+                }
                 nudgeSection(settings)
-                calendarSection(settings)
-                googleCalendarSection(settings)
+                if proStore.isPro {
+                    calendarSection(settings)
+                    googleCalendarSection(settings)
+                } else {
+                    lockedSettingsSection(
+                        title: "Calendar",
+                        feature: .integrations,
+                        label: "Apple and Google Calendar"
+                    )
+                    if settings.googleAccountEmail != nil {
+                        disconnectedGooglePrivacySection(settings)
+                    }
+                }
                 aboutSection
 
                 Text("Filuma \(appVersion) · woven with care")
@@ -179,6 +204,112 @@ struct SettingsView: View {
             }
         } message: {
             Text(notificationSettingIssue?.failureMessage ?? "")
+        }
+    }
+
+    private var proSection: some View {
+        SettingsGroup(
+            title: "Filuma Pro",
+            footer: proStore.isPro
+                ? "Your subscription keeps every Pro feature available on this Apple Account."
+                : "Three active tasks are free. Pro unlocks unlimited tasks, calendar integrations, widgets, repeats, advanced planning, and the full Weave."
+        ) {
+            if proStore.isPro {
+                SettingsRow(icon: "flame.fill", tint: .brand300, label: "Filuma Pro") {
+                    Text("Active")
+                        .font(AppFont.bodySemibold(13))
+                        .foregroundStyle(Color.personalDisplay)
+                }
+
+                Link(destination: URL(string: "https://apps.apple.com/account/subscriptions")!) {
+                    SettingsRow(icon: "gearshape.fill", tint: .filumaSubtle, label: "Manage subscription") {
+                        Image(systemName: "arrow.up.right")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(Color.filumaFaint)
+                    }
+                }
+                .buttonStyle(.plain)
+            } else {
+                Button {
+                    showingPaywallFeature = .general
+                } label: {
+                    SettingsRow(icon: "sparkles", tint: .brand300, label: "Unlock Filuma Pro", labelTint: .brand300) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(Color.brand300)
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+
+            Button {
+                Task { await proStore.restorePurchases() }
+            } label: {
+                SettingsRow(icon: "arrow.clockwise", tint: .filumaSubtle, label: "Restore purchases") {
+                    if proStore.isChecking {
+                        ProgressView()
+                            .tint(Color.brand300)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+
+            if let issue = proStore.lastIssue {
+                Text(issue)
+                    .font(AppFont.caption(12))
+                    .foregroundStyle(Color.filumaSubtle)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+            }
+        }
+    }
+
+    private func lockedSettingsSection(
+        title: String,
+        feature: ProFeature,
+        label: String
+    ) -> some View {
+        SettingsGroup(title: title, footer: feature.message) {
+            Button {
+                showingPaywallFeature = feature
+            } label: {
+                SettingsRow(icon: "lock.fill", tint: .brand300, label: label, labelTint: .brand300) {
+                    Text("Pro")
+                        .font(AppFont.bodySemibold(12))
+                        .foregroundStyle(Color.brand300)
+                }
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    /// Keep a direct privacy escape hatch even after a subscription expires.
+    private func disconnectedGooglePrivacySection(_ settings: UserSettings) -> some View {
+        SettingsGroup(
+            title: "Connected account",
+            footer: "Sync is paused while Filuma Pro is inactive. You can disconnect at any time."
+        ) {
+            SettingsRow(
+                icon: "person.crop.circle.fill",
+                tint: .personalDisplay,
+                label: settings.googleAccountEmail ?? "Google account"
+            ) {
+                Button("Disconnect") {
+                    confirmGoogleDisconnect = true
+                }
+                .font(AppFont.caption(13))
+                .foregroundStyle(Color.filumaRed)
+                .buttonStyle(.plain)
+                .frame(minWidth: 44, minHeight: 44)
+            }
+            .alert("Disconnect Google Calendar?", isPresented: $confirmGoogleDisconnect) {
+                Button("Stay connected", role: .cancel) { }
+                Button("Disconnect", role: .destructive) {
+                    disconnectGoogle(settings)
+                }
+            } message: {
+                Text("Imported Google events are removed. Work blocks already exported to Google Calendar stay there.")
+            }
         }
     }
 

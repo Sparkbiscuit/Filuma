@@ -66,6 +66,7 @@
 		0CAF00412D6D3EF700D079F0 /* DataExporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CAF00402D6D3EF700D079F0 /* DataExporter.swift */; };
 		0CAF00512D6D3EF700D079F0 /* GoogleAuth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CAF00502D6D3EF700D079F0 /* GoogleAuth.swift */; };
 		0CAF00532D6D3EF700D079F0 /* GoogleCalendarService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CAF00522D6D3EF700D079F0 /* GoogleCalendarService.swift */; };
+		0CAF00612D6D3EF700D079F0 /* FilumaPro.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CAF00602D6D3EF700D079F0 /* FilumaPro.swift */; };
 		0CAF00552D6D3EF700D079F0 /* GoogleCalendarTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0CAF00542D6D3EF700D079F0 /* GoogleCalendarTests.swift */; };
 		474BDD6A700E1F0E62824C42 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = ED345FA2EF5393B21BC69600 /* PrivacyInfo.xcprivacy */; };
 		515B330B47C0DFCB977ACC01 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = D31763024BD6C76ABBB705B9 /* PrivacyInfo.xcprivacy */; };
@@ -164,6 +165,7 @@
 		0CAF00402D6D3EF700D079F0 /* DataExporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DataExporter.swift; sourceTree = "<group>"; };
 		0CAF00502D6D3EF700D079F0 /* GoogleAuth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GoogleAuth.swift; sourceTree = "<group>"; };
 		0CAF00522D6D3EF700D079F0 /* GoogleCalendarService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GoogleCalendarService.swift; sourceTree = "<group>"; };
+		0CAF00602D6D3EF700D079F0 /* FilumaPro.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilumaPro.swift; sourceTree = "<group>"; };
 		0CAF00542D6D3EF700D079F0 /* GoogleCalendarTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GoogleCalendarTests.swift; sourceTree = "<group>"; };
 		D31763024BD6C76ABBB705B9 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		ED345FA2EF5393B21BC69600 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
@@ -249,6 +251,7 @@
 				0CA005022C6D3EF700D079F0 /* CalendarImportService.swift */,
 				0CAF00502D6D3EF700D079F0 /* GoogleAuth.swift */,
 				0CAF00522D6D3EF700D079F0 /* GoogleCalendarService.swift */,
+				0CAF00602D6D3EF700D079F0 /* FilumaPro.swift */,
 				0CA007002C6D3EF700D079F0 /* NotificationService.swift */,
 				0CA008002C6D3EF700D079F0 /* BlockNotificationService.swift */,
 				0CA005002C6D3EF700D079F0 /* OnboardingView.swift */,
@@ -523,6 +526,7 @@
 				0CA005032C6D3EF700D079F0 /* CalendarImportService.swift in Sources */,
 				0CAF00512D6D3EF700D079F0 /* GoogleAuth.swift in Sources */,
 				0CAF00532D6D3EF700D079F0 /* GoogleCalendarService.swift in Sources */,
+				0CAF00612D6D3EF700D079F0 /* FilumaPro.swift in Sources */,
 				0CA006012C6D3EF700D079F0 /* SharedStore.swift in Sources */,
 				0CA006042C6D3EF700D079F0 /* TaskEditView.swift in Sources */,
 				0CA007012C6D3EF700D079F0 /* NotificationService.swift in Sources */,
@@ -705,7 +709,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Filuma/Filuma.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 7;
 				DEVELOPMENT_ASSET_PATHS = "\"Filuma/Preview Content\"";
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -743,7 +747,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Filuma/Filuma.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 7;
 				DEVELOPMENT_ASSET_PATHS = "\"Filuma/Preview Content\"";
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -780,7 +784,7 @@
 				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 7;
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -802,7 +806,7 @@
 				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 7;
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -823,7 +827,7 @@
 			buildSettings = {
 				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 7;
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -844,7 +848,7 @@
 			buildSettings = {
 				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 7;
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
@@ -865,7 +869,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = FilumaWidgets/FilumaWidgets.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 7;
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = FilumaWidgets/Info.plist;
@@ -892,7 +896,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = FilumaWidgets/FilumaWidgets.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 6;
+				CURRENT_PROJECT_VERSION = 7;
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = FilumaWidgets/Info.plist;

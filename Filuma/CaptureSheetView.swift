@@ -15,6 +15,7 @@ struct CaptureSheetView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(FilumaProStore.self) private var proStore
 
     @State private var title = ""
     @State private var firstStep = ""
@@ -71,6 +72,7 @@ struct CaptureSheetView: View {
     @State private var captureSuccess: String?
     @State private var isSubmitting = false
     @State private var showDiscardConfirmation = false
+    @State private var showingPaywallFeature: ProFeature?
 
     // Voice
     @State private var isListening = false
@@ -173,6 +175,9 @@ struct CaptureSheetView: View {
                     onBulkCaptured?(receipt)
                     dismiss()
                 }
+            }
+            .sheet(item: $showingPaywallFeature) { feature in
+                FilumaPaywallView(feature: feature)
             }
             .alert("Scheduling Warning", isPresented: $showWarning) {
                 Button("Make Room") { makeRoom() }
@@ -955,6 +960,10 @@ struct CaptureSheetView: View {
             identifier: "capture.repeat.weekly",
             fillsWidth: dynamicTypeSize.isAccessibilitySize
         ) {
+            guard proStore.isPro else {
+                showingPaywallFeature = .repeatTasks
+                return
+            }
             UISelectionFeedbackGenerator().selectionChanged()
             withAnimation(spatialAnimation) {
                 repeatWeekly = true
@@ -1055,6 +1064,10 @@ struct CaptureSheetView: View {
     private var schedulingOptionsDisclosure: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
+                guard proStore.isPro else {
+                    showingPaywallFeature = .planning
+                    return
+                }
                 UISelectionFeedbackGenerator().selectionChanged()
                 withAnimation(spatialAnimation) {
                     showSchedulingOptions.toggle()
@@ -1212,6 +1225,24 @@ struct CaptureSheetView: View {
 
     private func attemptSchedule() {
         guard canSubmit else { return }
+        let activeTaskCount: Int
+        do {
+            activeTaskCount = try modelContext.fetchCount(FetchDescriptor<FilumaTask>(
+                predicate: #Predicate { !$0.isComplete }
+            ))
+        } catch {
+            failCapture("Filuma couldn't check your active tasks yet. Your capture is still here—try again.")
+            return
+        }
+        guard SubscriptionPolicy.canAddTasks(
+            activeTaskCount: activeTaskCount,
+            requestedCount: 1,
+            isPro: proStore.isPro
+        ) else {
+            focusedField = nil
+            showingPaywallFeature = .taskLimit
+            return
+        }
         discardPending()
         focusedField = nil
         captureIssue = nil

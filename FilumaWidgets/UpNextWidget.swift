@@ -37,12 +37,13 @@ struct UpNextEntry: TimelineEntry {
     }
 
     let date: Date
+    let isPro: Bool
     let items: [ItemInfo]
 }
 
 struct UpNextProvider: TimelineProvider {
     func placeholder(in context: Context) -> UpNextEntry {
-        UpNextEntry(date: Date(), items: [
+        UpNextEntry(date: Date(), isPro: true, items: [
             .init(id: UUID(), kind: .block, title: "Finish lab report", contextName: "School",
                   start: Date().addingTimeInterval(3600), end: Date().addingTimeInterval(5400))
         ])
@@ -71,7 +72,7 @@ struct UpNextProvider: TimelineProvider {
     private func fetchEntry() -> UpNextEntry {
         let now = Date()
         guard let container = WidgetStore.container else {
-            return UpNextEntry(date: now, items: [])
+            return UpNextEntry(date: now, isPro: FilumaProAccess.isPro, items: [])
         }
         let context = ModelContext(container)
 
@@ -129,7 +130,11 @@ struct UpNextProvider: TimelineProvider {
             .sorted { $0.start < $1.start }
             .prefix(4)
 
-        return UpNextEntry(date: now, items: Array(items))
+        return UpNextEntry(
+            date: now,
+            isPro: FilumaProAccess.isPro,
+            items: Array(items)
+        )
     }
 }
 
@@ -160,15 +165,19 @@ private struct UpNextWidgetView: View {
     let entry: UpNextEntry
 
     var body: some View {
-        switch family {
-        case .accessoryInline:
-            inlineView
-        case .accessoryRectangular:
-            rectangularView
-        case .systemMedium:
-            mediumView
-        default:
-            smallView
+        if entry.isPro {
+            switch family {
+            case .accessoryInline:
+                inlineView
+            case .accessoryRectangular:
+                rectangularView
+            case .systemMedium:
+                mediumView
+            default:
+                smallView
+            }
+        } else {
+            ProWidgetGate(family: family)
         }
     }
 

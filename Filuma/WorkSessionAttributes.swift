@@ -202,7 +202,8 @@ enum WorkSessionActivityController {
         ringStartsAt: Date? = nil,
         ringEndsAt: Date? = nil
     ) {
-        guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
+        guard FilumaProAccess.isPro,
+              ActivityAuthorizationInfo().areActivitiesEnabled else { return }
 
         let attributes = WorkSessionAttributes(
             taskTitle: taskTitle,

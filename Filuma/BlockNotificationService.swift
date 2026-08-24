@@ -12,6 +12,86 @@ import SwiftData
 /// without moving the block.
 enum BlockNotificationService {
 
+    /// A single user-facing nudge preference change. Keeping the mutation as a
+    /// value makes the SwiftData boundary explicit and gives Settings enough
+    /// information to retry the exact rejected choice.
+    enum PreferenceUpdate: Equatable {
+        case blockRemindersEnabled(Bool)
+        case blockReminderLeadMinutes(Int)
+        case morningPreviewEnabled(Bool)
+        case eveningReviewEnabled(Bool)
+        case eveningReviewTime(hour: Int, minute: Int)
+
+        var requiresAuthorization: Bool {
+            switch self {
+            case .blockRemindersEnabled(true),
+                 .morningPreviewEnabled(true),
+                 .eveningReviewEnabled(true):
+                return true
+            default:
+                return false
+            }
+        }
+
+        var failureMessage: String {
+            switch self {
+            case .blockRemindersEnabled:
+                return "Filuma couldn’t save the block nudge setting, so it stayed where it was. Try again."
+            case .blockReminderLeadMinutes:
+                return "Filuma couldn’t save the early heads-up time, so the previous time is still in use. Try again."
+            case .morningPreviewEnabled:
+                return "Filuma couldn’t save the morning preview setting, so it stayed where it was. Try again."
+            case .eveningReviewEnabled:
+                return "Filuma couldn’t save the evening wrap-up setting, so it stayed where it was. Try again."
+            case .eveningReviewTime:
+                return "Filuma couldn’t save the wrap-up time, so the previous time is still in use. Try again."
+            }
+        }
+
+        fileprivate func apply(to settings: UserSettings) {
+            switch self {
+            case .blockRemindersEnabled(let enabled):
+                settings.blockRemindersEnabled = enabled
+            case .blockReminderLeadMinutes(let minutes):
+                settings.blockReminderLeadMinutes = minutes
+            case .morningPreviewEnabled(let enabled):
+                settings.morningPreviewEnabled = enabled
+            case .eveningReviewEnabled(let enabled):
+                settings.eveningReviewEnabled = enabled
+            case .eveningReviewTime(let hour, let minute):
+                settings.eveningReviewHour = hour
+                settings.eveningReviewMinute = minute
+            }
+        }
+    }
+
+    private struct HeldPreferences {
+        let blockRemindersEnabled: Bool
+        let blockReminderLeadMinutes: Int
+        let morningPreviewEnabled: Bool
+        let eveningReviewEnabled: Bool
+        let eveningReviewHour: Int
+        let eveningReviewMinute: Int
+
+        init(_ settings: UserSettings) {
+            blockRemindersEnabled = settings.blockRemindersEnabled
+            blockReminderLeadMinutes = settings.blockReminderLeadMinutes
+            morningPreviewEnabled = settings.morningPreviewEnabled
+            eveningReviewEnabled = settings.eveningReviewEnabled
+            eveningReviewHour = settings.eveningReviewHour
+            eveningReviewMinute = settings.eveningReviewMinute
+        }
+
+        func repair(_ settings: UserSettings) {
+            settings.blockRemindersEnabled = blockRemindersEnabled
+            settings.blockReminderLeadMinutes = blockReminderLeadMinutes
+            settings.morningPreviewEnabled = morningPreviewEnabled
+            settings.eveningReviewEnabled = eveningReviewEnabled
+            settings.eveningReviewHour = eveningReviewHour
+            settings.eveningReviewMinute = eveningReviewMinute
+        }
+    }
+
     static let categoryId = "FILUMA_BLOCK_START"
     static let startActionId = "FILUMA_START_SESSION"
     static let snoozeActionId = "FILUMA_SNOOZE_10"
@@ -25,6 +105,40 @@ enum BlockNotificationService {
     private static let directRequestThreshold = 60
 
     @MainActor private static var resyncGeneration: UInt = 0
+
+    /// Durably commit one nudge preference, then reconcile system
+    /// notifications. The preflight accepts unrelated pending work before the
+    /// rollback boundary; a rejected transaction repairs every held nudge
+    /// field and never reaches Notification Center.
+    @MainActor
+    static func updatePreference(
+        _ update: PreferenceUpdate,
+        settings: UserSettings,
+        context: ModelContext,
+        save: (ModelContext) throws -> Void = { try $0.save() },
+        reconcile: @MainActor (ModelContext) -> Void = { context in
+            resync(context: context)
+        }
+    ) throws {
+        try context.save()
+        let held = HeldPreferences(settings)
+
+        do {
+            try context.transaction {
+                update.apply(to: settings)
+                try save(context)
+            }
+        } catch {
+            context.rollback()
+            held.repair(settings)
+            context.processPendingChanges()
+            throw error
+        }
+
+        // This intentionally runs outside the SwiftData transaction. System
+        // notification work is asynchronous and cannot be part of rollback.
+        reconcile(context)
+    }
 
     private static func isResyncOwnedIdentifier(_ identifier: String) -> Bool {
         if identifier.hasPrefix(digestIdPrefix) { return true }

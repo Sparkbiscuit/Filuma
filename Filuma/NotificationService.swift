@@ -18,30 +18,54 @@ enum NotificationService {
         }
     }
 
-    static func schedule(for reminder: Reminder) {
-        guard reminder.dueDate > Date() else { return }
+    static func schedule(receipt: ReminderCaptureReceipt) {
+        schedule(
+            title: receipt.title,
+            dueDate: receipt.dueDate,
+            notificationID: receipt.notificationID
+        )
+    }
+
+    /// Re-arm a restored reminder from post-commit scalar facts. The caller
+    /// never needs to keep a SwiftData model alive across the save boundary.
+    static func schedule(receipt: ReminderMutationReceipt) {
+        schedule(
+            title: receipt.title,
+            dueDate: receipt.dueDate,
+            notificationID: receipt.notificationID
+        )
+    }
+
+    private static func schedule(
+        title: String,
+        dueDate: Date,
+        notificationID: String
+    ) {
+        guard dueDate > Date() else { return }
 
         let content = UNMutableNotificationContent()
-        content.title = reminder.title
+        content.title = title
         content.body = "Reminder from Filuma"
         content.sound = .default
 
         let components = Calendar.current.dateComponents(
             [.year, .month, .day, .hour, .minute],
-            from: reminder.dueDate
+            from: dueDate
         )
         let trigger = UNCalendarNotificationTrigger(dateMatching: components, repeats: false)
         let request = UNNotificationRequest(
-            identifier: reminder.notificationId,
+            identifier: notificationID,
             content: content,
             trigger: trigger
         )
         BlockNotificationService.addDirectRequestMakingRoom(request)
     }
 
-    static func cancel(_ reminder: Reminder) {
+    /// Cancel from a durable receipt, including after the source row has been
+    /// deleted from SwiftData.
+    static func cancel(notificationID: String) {
         let center = UNUserNotificationCenter.current()
-        center.removePendingNotificationRequests(withIdentifiers: [reminder.notificationId])
-        center.removeDeliveredNotifications(withIdentifiers: [reminder.notificationId])
+        center.removePendingNotificationRequests(withIdentifiers: [notificationID])
+        center.removeDeliveredNotifications(withIdentifiers: [notificationID])
     }
 }

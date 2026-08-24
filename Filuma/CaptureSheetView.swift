@@ -5,9 +5,16 @@ import AVFoundation
 import UIKit
 
 struct CaptureSheetView: View {
+    var onTaskCaptured: ((TaskCaptureReceipt) -> Void)? = nil
+    var onReminderCaptured: ((ReminderCaptureReceipt) -> Void)? = nil
+    var onBulkCaptured: ((BulkCaptureReceipt) -> Void)? = nil
+
     @Environment(\.modelContext) private var modelContext
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     @State private var title = ""
     @State private var firstStep = ""
@@ -31,10 +38,25 @@ struct CaptureSheetView: View {
     private enum CaptureMode: String, CaseIterable {
         case task = "Task"
         case reminder = "Reminder"
+
+        var icon: String {
+            switch self {
+            case .task: "calendar.badge.clock"
+            case .reminder: "bell"
+            }
+        }
+
+        var subtitle: String {
+            switch self {
+            case .task: "Get it out of your head. Filuma will find the time."
+            case .reminder: "Keep one small thing from slipping away."
+            }
+        }
     }
     @State private var captureMode: CaptureMode = .task
     @State private var reminderDate = Date().addingTimeInterval(3600)
     @State private var showNotificationsDeniedNote = false
+    @Namespace private var modeSelectionNamespace
 
     // Estimate reality-check: what the planned-vs-actual record says about
     // the current guess, and whether the suggestion was taken.
@@ -44,8 +66,11 @@ struct CaptureSheetView: View {
     // Scheduling result — nothing is committed until the user confirms.
     @State private var scheduleWarning: String?
     @State private var showWarning = false
-    @State private var pendingTask: FilumaTask?
-    @State private var pendingBlocks: [ScheduledBlock] = []
+    @State private var pendingCapture: PreparedTaskCapture?
+    @State private var captureIssue: String?
+    @State private var captureSuccess: String?
+    @State private var isSubmitting = false
+    @State private var showDiscardConfirmation = false
 
     // Voice
     @State private var isListening = false
@@ -54,42 +79,98 @@ struct CaptureSheetView: View {
     @State private var recognitionTask: SFSpeechRecognitionTask?
     @State private var audioEngine = AVAudioEngine()
     @State private var activeRecognitionID: UUID?
+    @State private var activeVoiceAuthorizationID: UUID?
+    @State private var hasInstalledAudioTap = false
+    @State private var isViewActive = false
     @State private var voiceInputIssue: VoiceInputIssue?
 
-    @FocusState private var titleFocused: Bool
+    private enum FocusedField: Hashable {
+        case title
+        case firstStep
+    }
+    @FocusState private var focusedField: FocusedField?
 
     private let effortOptions = [30, 60, 120]
 
+    private var controlAnimation: Animation? {
+        reduceMotion ? HearthMotion.reduced : HearthMotion.selection
+    }
+
+    /// Layout-changing choices settle immediately with Reduce Motion. Compact
+    /// color and opacity feedback can still use `controlAnimation` above.
+    private var spatialAnimation: Animation? {
+        reduceMotion ? nil : HearthMotion.selection
+    }
+
+    private var modeTransition: AnyTransition {
+        .opacity
+    }
+
+    private var trimmedTitle: String {
+        title.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var hasMeaningfulDraft: Bool {
+        !trimmedTitle.isEmpty
+            || !firstStep.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var canSubmit: Bool {
+        !trimmedTitle.isEmpty && !isSubmitting && captureSuccess == nil
+    }
+
     var body: some View {
         NavigationStack {
-            VStack(spacing: 0) {
-                sheetHeader
+            ZStack {
+                HearthScreenBackground(
+                    topGlow: 0.18,
+                    bottomGlow: 0.24,
+                    embers: reduceMotion ? 0 : 10,
+                    emberIntensity: 0.7
+                )
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 22) {
-                        modePicker
-                        titleField
-                        if captureMode == .task {
-                            firstStepField
-                            contextPicker
-                            deadlinePicker
-                            effortPicker
-                            estimateAdviceRow
-                            schedulingOptionsDisclosure
-                            scheduleButton
-                        } else {
-                            reminderDatePicker
-                            reminderButton
+                VStack(spacing: 0) {
+                    sheetHeader
+
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 18) {
+                            modePicker
+
+                            if let captureIssue {
+                                captureIssueBanner(captureIssue)
+                            }
+
+                            captureCard
+
+                            Group {
+                                if captureMode == .task {
+                                    planShapeCard
+                                    estimateAdviceRow
+                                    schedulingOptionsDisclosure
+                                } else {
+                                    reminderCard
+                                }
+                            }
+                            .id(captureMode)
+                            .transition(modeTransition)
                         }
+                        .frame(maxWidth: FilumaLayout.onboardingContentMaxWidth)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, FilumaSpacing.screen)
+                        .padding(.top, 6)
+                        .padding(.bottom, 36)
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 40)
+                    .scrollDismissesKeyboard(.interactively)
+                    .scrollIndicators(.hidden)
                 }
             }
-            .hearthScreen(topGlow: 0.18, bottomGlow: 0.24)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                captureActionBar
+            }
             .toolbar(.hidden, for: .navigationBar)
             .navigationDestination(isPresented: $showBulk) {
-                BulkEntryView {
+                BulkEntryView { receipt in
+                    onBulkCaptured?(receipt)
                     dismiss()
                 }
             }
@@ -116,7 +197,13 @@ struct CaptureSheetView: View {
                 )
             }
             .onAppear {
-                titleFocused = true
+                isViewActive = true
+                if !voiceOverEnabled {
+                    Task { @MainActor in
+                        await Task.yield()
+                        focusedField = .title
+                    }
+                }
                 refreshEstimateAdvice()
             }
             .onChange(of: context) { _, _ in
@@ -131,62 +218,352 @@ struct CaptureSheetView: View {
                 refreshEstimateAdvice()
             }
             .onChange(of: scenePhase) { _, newPhase in
-                if newPhase != .active && isListening { stopListening() }
+                if newPhase == .background {
+                    activeVoiceAuthorizationID = nil
+                    if isListening || hasInstalledAudioTap { stopListening() }
+                } else if newPhase == .inactive,
+                          isListening || hasInstalledAudioTap {
+                    // A speech or microphone permission sheet also makes the
+                    // scene inactive. Keep its authorization token alive, but
+                    // stop an already-running recorder if another interruption
+                    // takes focus away from the app.
+                    stopListening()
+                }
             }
-            .onDisappear { if isListening { stopListening() } }
+            .onDisappear {
+                isViewActive = false
+                activeVoiceAuthorizationID = nil
+                if isListening || hasInstalledAudioTap { stopListening() }
+            }
+            .confirmationDialog(
+                "Discard this capture?",
+                isPresented: $showDiscardConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Discard", role: .destructive) {
+                    discardPending()
+                    dismiss()
+                }
+                Button("Keep Editing", role: .cancel) { }
+            } message: {
+                Text("Your title and choices have not been saved yet.")
+            }
         }
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .presentationCornerRadius(FilumaRadius.sheet)
+        .interactiveDismissDisabled(hasMeaningfulDraft || isSubmitting)
     }
 
     // MARK: - Header
 
     private var sheetHeader: some View {
-        HStack {
-            Button("Cancel") { dismiss() }
-                .font(AppFont.caption(14))
-                .foregroundStyle(Color.filumaSubtle)
-                .contentShape(Rectangle().inset(by: -14))
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Quick capture")
+                    .font(AppFont.caption(10))
+                    .foregroundStyle(Color.brand300)
 
-            Spacer()
+                Text("Capture")
+                    .font(AppFont.title(25))
+                    .foregroundStyle(Color.filumaText)
+                    .accessibilityAddTraits(.isHeader)
+                    .accessibilityIdentifier("capture.title")
 
-            Button("Bulk add") { showBulk = true }
-                .font(AppFont.caption(14))
-                .foregroundStyle(Color.brand300)
-                .contentShape(Rectangle().inset(by: -14))
+                Text(captureMode.subtitle)
+                    .font(AppFont.body(12))
+                    .foregroundStyle(Color.filumaSubtle)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .animation(controlAnimation, value: captureMode)
+            }
+
+            Spacer(minLength: 8)
+
+            if captureMode == .task {
+                Button {
+                    focusedField = nil
+                    showBulk = true
+                } label: {
+                    Label("Bulk", systemImage: "rectangle.stack.badge.plus")
+                        .font(AppFont.caption(12))
+                        .foregroundStyle(Color.brand300)
+                        .padding(.horizontal, 12)
+                        .frame(minHeight: 44)
+                        .background(Color.brand500.opacity(0.1), in: Capsule())
+                        .contentShape(Rectangle())
+                }
+                .hearthPressStyle(scale: 0.97, pressedOpacity: 0.82)
+                .disabled(isSubmitting || captureSuccess != nil)
+                .opacity(isSubmitting || captureSuccess != nil ? 0.48 : 1)
+                .accessibilityLabel("Bulk add")
+                .accessibilityIdentifier("capture.bulk")
+            }
+
+            Button(action: requestDismiss) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(Color.filumaSubtle)
+                    .frame(width: 44, height: 44)
+                    .background(Color.filumaSurface2, in: Circle())
+                    .contentShape(Circle())
+            }
+            .hearthPressStyle(scale: 0.94, pressedOpacity: 0.76)
+            .disabled(isSubmitting)
+            .opacity(isSubmitting ? 0.48 : 1)
+            .accessibilityLabel("Close")
+            .accessibilityIdentifier("capture.close")
         }
-        .padding(.horizontal, 20)
-        .padding(.top, 18)
-        .padding(.bottom, 18)
+        .padding(.horizontal, FilumaSpacing.screen)
+        .padding(.top, 16)
+        .padding(.bottom, 12)
+        .frame(maxWidth: FilumaLayout.onboardingContentMaxWidth)
+        .frame(maxWidth: .infinity)
     }
 
     // MARK: - Mode picker
 
     private var modePicker: some View {
-        HStack(spacing: 2) {
+        HStack(spacing: 4) {
             ForEach(CaptureMode.allCases, id: \.self) { mode in
                 Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
+                    UISelectionFeedbackGenerator().selectionChanged()
+                    withAnimation(spatialAnimation) {
                         captureMode = mode
+                        captureIssue = nil
+                        showNotificationsDeniedNote = false
                     }
                 } label: {
-                    Text(mode.rawValue)
-                        .font(AppFont.caption(13))
-                        .foregroundStyle(captureMode == mode ? Color.brand100 : Color.filumaSubtle)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 7)
-                        .background(
-                            Capsule()
-                                .fill(captureMode == mode ? Color.brand500.opacity(0.28) : Color.clear)
-                        )
+                    HStack(spacing: 7) {
+                        Image(systemName: mode.icon)
+                            .font(.system(size: 13, weight: .semibold))
+                        Text(mode.rawValue)
+                            .font(AppFont.bodySemibold(13))
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(captureMode == mode ? Color.brand100 : Color.filumaSubtle)
+                    .frame(maxWidth: .infinity, minHeight: 44)
+                    .background {
+                        if captureMode == mode {
+                            if reduceMotion {
+                                captureModeSelectionCapsule
+                            } else {
+                                captureModeSelectionCapsule
+                                    .matchedGeometryEffect(
+                                        id: "capture-mode",
+                                        in: modeSelectionNamespace
+                                    )
+                            }
+                        }
+                    }
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .disabled(isSubmitting || captureSuccess != nil)
+                .accessibilityAddTraits(captureMode == mode ? [.isSelected] : [])
+                .accessibilityIdentifier("capture.mode.\(mode.rawValue.lowercased())")
             }
         }
-        .padding(3)
+        .padding(4)
         .background(Capsule().fill(Color.filumaSurface))
         .overlay(Capsule().stroke(Color.filumaBorder, lineWidth: 1))
+    }
+
+    private var captureModeSelectionCapsule: some View {
+        Capsule()
+            .fill(Color.brand500.opacity(0.24))
+            .overlay(Capsule().stroke(Color.brand500.opacity(0.34), lineWidth: 1))
+    }
+
+    // MARK: - Authored form surfaces
+
+    private var captureCard: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            titleField
+
+            if captureMode == .task {
+                Divider()
+                    .overlay(Color.filumaBorder)
+                    .padding(.vertical, 14)
+                firstStepField
+            }
+        }
+        .padding(16)
+        .background(Color.filumaSurface)
+        .clipShape(RoundedRectangle(cornerRadius: FilumaRadius.hero, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: FilumaRadius.hero, style: .continuous)
+                .stroke(
+                    focusedField != nil || isListening
+                        ? Color.brand500.opacity(0.38)
+                        : Color.filumaBorder,
+                    lineWidth: 1
+                )
+        }
+        .hearthGlow(
+            .brand500,
+            radius: focusedField != nil || isListening ? 16 : 0,
+            opacity: focusedField != nil || isListening ? 0.12 : 0
+        )
+        .animation(controlAnimation, value: focusedField)
+        .animation(controlAnimation, value: isListening)
+    }
+
+    private var planShapeCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            captureSectionHeading(
+                eyebrow: "Plan shape",
+                message: "Enough structure to place the work—nothing more."
+            )
+            contextPicker
+            captureDivider
+            deadlinePicker
+            captureDivider
+            effortPicker
+        }
+        .padding(16)
+        .background(Color.filumaSurface)
+        .clipShape(RoundedRectangle(cornerRadius: FilumaRadius.card, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: FilumaRadius.card, style: .continuous)
+                .stroke(Color.filumaBorder, lineWidth: 1)
+        }
+    }
+
+    private var reminderCard: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            captureSectionHeading(
+                eyebrow: "When",
+                message: "Filuma keeps the reminder here even if notifications are off."
+            )
+            reminderDatePicker
+        }
+        .padding(16)
+        .background(Color.filumaSurface)
+        .clipShape(RoundedRectangle(cornerRadius: FilumaRadius.card, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: FilumaRadius.card, style: .continuous)
+                .stroke(Color.filumaBorder, lineWidth: 1)
+        }
+    }
+
+    private var captureDivider: some View {
+        Divider().overlay(Color.filumaBorder)
+    }
+
+    private func captureSectionHeading(
+        eyebrow: String,
+        message: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(eyebrow)
+                .font(AppFont.heading(14))
+                .foregroundStyle(Color.filumaText)
+            Text(message)
+                .font(AppFont.body(12))
+                .foregroundStyle(Color.filumaSubtle)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func captureIssueBanner(_ message: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Color.filumaRed)
+                .accessibilityHidden(true)
+            Text(message)
+                .font(AppFont.body(13))
+                .foregroundStyle(Color.filumaText)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .background(Color.filumaRed.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: FilumaRadius.row, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: FilumaRadius.row, style: .continuous)
+                .stroke(Color.filumaRed.opacity(0.25), lineWidth: 1)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("capture.issue")
+    }
+
+    // MARK: - Fixed action boundary
+
+    private var captureActionBar: some View {
+        VStack(spacing: 8) {
+            if showNotificationsDeniedNote {
+                Text("Saved in Filuma. Notifications are off, so no alert will fire.")
+                    .font(AppFont.body(12))
+                    .foregroundStyle(Color.filumaSubtle)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Button(action: performPrimaryAction) {
+                HStack(spacing: 9) {
+                    if isSubmitting {
+                        ProgressView()
+                            .tint(Color.filumaControlInk)
+                            .accessibilityHidden(true)
+                    } else {
+                        Image(systemName: primaryActionIcon)
+                            .font(.system(size: 16, weight: .bold))
+                            .accessibilityHidden(true)
+                    }
+                    Text(primaryActionTitle)
+                        .lineLimit(1)
+                }
+                .primaryButtonStyle(enabled: canSubmit || captureSuccess != nil)
+            }
+            .disabled(!canSubmit && captureSuccess == nil)
+            .hearthPressStyle(scale: 0.98, pressedOpacity: 0.88)
+            .accessibilityIdentifier(
+                captureSuccess == nil ? "capture.primaryAction" : "capture.success"
+            )
+        }
+        .padding(.horizontal, FilumaSpacing.screen)
+        .padding(.top, 14)
+        .padding(.bottom, 10)
+        .frame(maxWidth: FilumaLayout.onboardingContentMaxWidth)
+        .frame(maxWidth: .infinity)
+        .background(Color.filumaBackground.opacity(0.98).ignoresSafeArea(edges: .bottom))
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.filumaBorder)
+                .frame(height: 1)
+        }
+    }
+
+    private var primaryActionTitle: String {
+        if let captureSuccess { return captureSuccess }
+        if isSubmitting { return "Saving…" }
+        return captureMode == .task ? "Schedule task" : "Set reminder"
+    }
+
+    private var primaryActionIcon: String {
+        if captureSuccess != nil { return "checkmark" }
+        return captureMode == .task ? "calendar.badge.clock" : "bell.badge"
+    }
+
+    private func performPrimaryAction() {
+        if captureSuccess != nil {
+            dismiss()
+        } else if captureMode == .task {
+            attemptSchedule()
+        } else {
+            saveReminder()
+        }
+    }
+
+    private func requestDismiss() {
+        guard !isSubmitting else { return }
+        focusedField = nil
+        if hasMeaningfulDraft {
+            showDiscardConfirmation = true
+        } else {
+            dismiss()
+        }
     }
 
     // MARK: - Reminder form
@@ -206,47 +583,16 @@ struct CaptureSheetView: View {
             .datePickerStyle(.compact)
             .labelsHidden()
             .tint(Color.brand500)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
             .accessibilityLabel("Remind me at")
+            .accessibilityIdentifier("capture.reminderDate")
 
             if showNotificationsDeniedNote {
-                Text("Notifications are off for Filuma. The reminder is saved, but no alert will fire; enable notifications in Settings.")
-                    .font(AppFont.body(12))
-                    .foregroundStyle(Color.filumaRed)
-            }
-        }
-    }
-
-    private var reminderButton: some View {
-        Button {
-            saveReminder()
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "bell.badge")
-                    .font(.system(size: 16, weight: .semibold))
-                Text("Set Reminder")
-            }
-            .primaryButtonStyle(enabled: !title.isEmpty)
-        }
-        .disabled(title.isEmpty)
-        .padding(.top, 6)
-    }
-
-    private func saveReminder() {
-        let reminder = Reminder(
-            title: title.trimmingCharacters(in: .whitespaces),
-            dueDate: reminderDate
-        )
-        modelContext.insert(reminder)
-        SharedStore.reloadWidgets()
-
-        Task { @MainActor in
-            let granted = await NotificationService.requestAuthorization()
-            if granted {
-                NotificationService.schedule(for: reminder)
-                dismiss()
-            } else {
-                showNotificationsDeniedNote = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { dismiss() }
+                Button("Open notification settings", action: openAppSettings)
+                    .font(AppFont.bodySemibold(12))
+                    .foregroundStyle(Color.brand300)
+                    .frame(minHeight: 44)
             }
         }
     }
@@ -255,16 +601,30 @@ struct CaptureSheetView: View {
 
     private var titleField: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("What needs to get done?")
+            Text(captureMode == .task ? "Task" : "Reminder")
                 .font(AppFont.caption(12))
                 .foregroundStyle(Color.filumaSubtle)
 
             HStack(spacing: 12) {
-                TextField("e.g. Finish lab report", text: $title)
+                TextField(
+                    captureMode == .task
+                        ? "e.g. Finish lab report"
+                        : "e.g. Bring the permission form",
+                    text: $title
+                )
                     .font(AppFont.heading(19))
                     .foregroundStyle(Color.filumaText)
-                    .focused($titleFocused)
-                    .submitLabel(.done)
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
+                    .focused($focusedField, equals: .title)
+                    .submitLabel(captureMode == .task ? .next : .done)
+                    .onSubmit {
+                        if captureMode == .task {
+                            focusedField = .firstStep
+                        } else {
+                            focusedField = nil
+                        }
+                    }
                     .accessibilityIdentifier("capture.taskTitleField")
 
                 Button {
@@ -280,6 +640,8 @@ struct CaptureSheetView: View {
                         )
                 }
                 .contentShape(Circle())
+                .disabled(isSubmitting || captureSuccess != nil)
+                .opacity(isSubmitting || captureSuccess != nil ? 0.48 : 1)
                 .accessibilityLabel(isListening ? "Stop voice input" : "Start voice input")
                 .accessibilityValue(isListening ? "Listening" : "Not listening")
                 .accessibilityHint(
@@ -299,14 +661,19 @@ struct CaptureSheetView: View {
     /// and the work session timer.
     private var firstStepField: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("What's the very first physical action? (optional)")
+            Text("First move · Optional")
                 .font(AppFont.caption(12))
                 .foregroundStyle(Color.filumaSubtle)
 
             TextField("e.g. Open the doc and paste the data", text: $firstStep)
                 .font(AppFont.body(15))
                 .foregroundStyle(Color.filumaText)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
                 .submitLabel(.done)
+                .focused($focusedField, equals: .firstStep)
+                .onSubmit { focusedField = nil }
+                .accessibilityIdentifier("capture.firstStepField")
         }
     }
 
@@ -318,27 +685,53 @@ struct CaptureSheetView: View {
                 .font(AppFont.caption(12))
                 .foregroundStyle(Color.filumaSubtle)
 
-            HStack(spacing: 8) {
-                ForEach(TaskContext.allCases) { ctx in
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            context = ctx
-                        }
-                    } label: {
-                        Text(ctx.rawValue)
-                            .font(AppFont.caption(12))
-                            .foregroundStyle(context == ctx ? .white : Color.filumaText)
-                            .padding(.horizontal, 13)
-                            .padding(.vertical, 9)
-                            .background(
-                                Capsule()
-                                    .fill(context == ctx ? ctx.color : Color.filumaSurface2)
-                            )
+            Group {
+                if dynamicTypeSize.isAccessibilitySize {
+                    LazyVGrid(
+                        columns: [
+                            GridItem(.flexible(), spacing: 8),
+                            GridItem(.flexible(), spacing: 8)
+                        ],
+                        spacing: 8
+                    ) {
+                        contextChoices
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityAddTraits(context == ctx ? [.isSelected] : [])
+                } else {
+                    HStack(spacing: 8) {
+                        contextChoices
+                    }
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var contextChoices: some View {
+        ForEach(TaskContext.allCases) { ctx in
+            Button {
+                UISelectionFeedbackGenerator().selectionChanged()
+                withAnimation(controlAnimation) {
+                    context = ctx
+                }
+            } label: {
+                Label(ctx.rawValue, systemImage: ctx.icon)
+                    .font(AppFont.caption(12))
+                    .foregroundStyle(context == ctx ? Color.filumaControlInk : Color.filumaText)
+                    .lineLimit(1)
+                    .padding(.horizontal, 12)
+                    .frame(
+                        maxWidth: dynamicTypeSize.isAccessibilitySize ? .infinity : nil,
+                        minHeight: 44
+                    )
+                    .background(
+                        Capsule()
+                            .fill(context == ctx ? ctx.color : Color.filumaSurface2)
+                    )
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityAddTraits(context == ctx ? [.isSelected] : [])
+            .accessibilityIdentifier("capture.context.\(ctx.rawValue.lowercased())")
         }
     }
 
@@ -359,7 +752,10 @@ struct CaptureSheetView: View {
             .datePickerStyle(.compact)
             .labelsHidden()
             .tint(Color.brand500)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
             .accessibilityLabel("Deadline")
+            .accessibilityIdentifier("capture.deadline")
         }
     }
 
@@ -371,45 +767,127 @@ struct CaptureSheetView: View {
                 .font(AppFont.caption(12))
                 .foregroundStyle(Color.filumaSubtle)
 
-            HStack(spacing: 8) {
-                ForEach(effortOptions, id: \.self) { mins in
-                    EffortChip(
-                        label: CountdownFormatter.effortString(minutes: mins),
-                        isSelected: !showCustomEffort && effortMinutes == mins
+            Group {
+                if dynamicTypeSize.isAccessibilitySize {
+                    LazyVGrid(
+                        columns: [
+                            GridItem(.flexible(), spacing: 8),
+                            GridItem(.flexible(), spacing: 8)
+                        ],
+                        spacing: 8
                     ) {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            showCustomEffort = false
-                            effortMinutes = mins
-                        }
+                        effortChoices
                     }
-                }
-                EffortChip(
-                    label: "3h+",
-                    isSelected: showCustomEffort
-                ) {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        showCustomEffort = true
-                        effortMinutes = customEffort
+                } else {
+                    HStack(spacing: 8) {
+                        effortChoices
                     }
                 }
             }
 
             if showCustomEffort {
-                Stepper(
-                    value: $customEffort,
-                    in: 180...720,
-                    step: 30
-                ) {
+                HStack(spacing: 12) {
                     Text(CountdownFormatter.effortString(minutes: customEffort))
                         .font(AppFont.mono(15))
                         .foregroundStyle(Color.filumaText)
+                    Spacer(minLength: 8)
+                    captureAdjustmentButton(
+                        systemName: "minus",
+                        label: "Decrease custom effort",
+                        identifier: "capture.customEffort.decrement",
+                        isDisabled: customEffort <= 180
+                    ) {
+                        customEffort = max(180, customEffort - 30)
+                    }
+                    captureAdjustmentButton(
+                        systemName: "plus",
+                        label: "Increase custom effort",
+                        identifier: "capture.customEffort.increment",
+                        isDisabled: customEffort >= 720,
+                        isPrimary: true
+                    ) {
+                        customEffort = min(720, customEffort + 30)
+                    }
                 }
                 .onChange(of: customEffort) { _, newValue in
                     effortMinutes = newValue
                 }
-                .padding(.top, 4)
+                .padding(.top, 2)
             }
         }
+    }
+
+    @ViewBuilder
+    private var effortChoices: some View {
+        ForEach(effortOptions, id: \.self) { mins in
+            EffortChip(
+                label: CountdownFormatter.effortString(minutes: mins),
+                isSelected: !showCustomEffort && effortMinutes == mins,
+                identifier: "capture.effort.\(mins)",
+                fillsWidth: dynamicTypeSize.isAccessibilitySize
+            ) {
+                chooseEffort(mins)
+            }
+        }
+        EffortChip(
+            label: "3h+",
+            isSelected: showCustomEffort,
+            identifier: "capture.effort.custom",
+            fillsWidth: dynamicTypeSize.isAccessibilitySize
+        ) {
+            UISelectionFeedbackGenerator().selectionChanged()
+            withAnimation(spatialAnimation) {
+                showCustomEffort = true
+                effortMinutes = customEffort
+            }
+        }
+    }
+
+    private func chooseEffort(_ minutes: Int) {
+        UISelectionFeedbackGenerator().selectionChanged()
+        withAnimation(spatialAnimation) {
+            showCustomEffort = false
+            effortMinutes = minutes
+        }
+    }
+
+    private func captureAdjustmentButton(
+        systemName: String,
+        label: String,
+        identifier: String,
+        isDisabled: Bool,
+        isPrimary: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button {
+            UISelectionFeedbackGenerator().selectionChanged()
+            action()
+        } label: {
+            Image(systemName: systemName)
+                .font(.system(size: 16, weight: .bold))
+                .foregroundStyle(isPrimary ? Color.filumaControlInk : Color.filumaText)
+                .frame(width: 44, height: 44)
+                .background(isPrimary ? Color.brand500 : Color.filumaSurface3)
+                .clipShape(
+                    RoundedRectangle(cornerRadius: FilumaRadius.button, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(
+                        cornerRadius: FilumaRadius.button,
+                        style: .continuous
+                    )
+                    .stroke(
+                        isPrimary ? Color.brand300.opacity(0.5) : Color.filumaBorder,
+                        lineWidth: 1
+                    )
+                }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .opacity(isDisabled ? 0.42 : 1)
+        .accessibilityLabel(label)
+        .accessibilityIdentifier(identifier)
     }
 
     // MARK: - Repeat picker
@@ -422,22 +900,11 @@ struct CaptureSheetView: View {
                 .font(AppFont.caption(12))
                 .foregroundStyle(Color.filumaSubtle)
 
-            HStack(spacing: 8) {
-                EffortChip(label: "One-off", isSelected: !repeatWeekly) {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        repeatWeekly = false
-                    }
-                }
-                EffortChip(label: "Weekly", isSelected: repeatWeekly) {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        repeatWeekly = true
-                        let nextWeek = Calendar.current.date(
-                            byAdding: .day,
-                            value: 7,
-                            to: deadline
-                        ) ?? deadline
-                        repeatUntil = max(repeatUntil, nextWeek)
-                    }
+            Group {
+                if dynamicTypeSize.isAccessibilitySize {
+                    VStack(spacing: 8) { repeatChoices }
+                } else {
+                    HStack(spacing: 8) { repeatChoices }
                 }
             }
 
@@ -446,6 +913,7 @@ struct CaptureSheetView: View {
                     Text("Until")
                         .font(AppFont.body(13))
                         .foregroundStyle(Color.filumaSubtle)
+                    Spacer(minLength: 8)
                     DatePicker(
                         "",
                         selection: $repeatUntil,
@@ -455,13 +923,47 @@ struct CaptureSheetView: View {
                     .datePickerStyle(.compact)
                     .labelsHidden()
                     .tint(Color.brand500)
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
                     .accessibilityLabel("Repeat until")
-                    Spacer()
                 }
-                .padding(.top, 4)
+                .padding(.top, 2)
                 Text("A fresh copy appears each week, scheduled around whatever that week holds.")
                     .font(AppFont.body(11))
                     .foregroundStyle(Color.filumaFaint)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var repeatChoices: some View {
+        EffortChip(
+            label: "One-off",
+            isSelected: !repeatWeekly,
+            identifier: "capture.repeat.oneOff",
+            fillsWidth: dynamicTypeSize.isAccessibilitySize
+        ) {
+            UISelectionFeedbackGenerator().selectionChanged()
+            withAnimation(spatialAnimation) {
+                        repeatWeekly = false
+            }
+        }
+        EffortChip(
+            label: "Weekly",
+            isSelected: repeatWeekly,
+            identifier: "capture.repeat.weekly",
+            fillsWidth: dynamicTypeSize.isAccessibilitySize
+        ) {
+            UISelectionFeedbackGenerator().selectionChanged()
+            withAnimation(spatialAnimation) {
+                repeatWeekly = true
+                let nextWeek = Calendar.current.date(
+                    byAdding: .day,
+                    value: 7,
+                    to: deadline
+                ) ?? deadline
+                repeatUntil = max(repeatUntil, nextWeek)
             }
         }
     }
@@ -502,10 +1004,11 @@ struct CaptureSheetView: View {
                     } label: {
                         Text("Plan for \(CountdownFormatter.effortString(minutes: advice.suggestedMinutes)) instead")
                             .font(AppFont.caption(13))
-                            .foregroundStyle(.white)
+                            .foregroundStyle(Color.filumaControlInk)
                             .padding(.horizontal, 14)
-                            .padding(.vertical, 8)
+                            .frame(minHeight: 44)
                             .background(Color.workColor, in: Capsule())
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                 }
@@ -531,7 +1034,8 @@ struct CaptureSheetView: View {
 
     private func acceptEstimateSuggestion() {
         guard let advice = estimateAdvice else { return }
-        withAnimation(.easeInOut(duration: 0.2)) {
+        UISelectionFeedbackGenerator().selectionChanged()
+        withAnimation(spatialAnimation) {
             if advice.suggestedMinutes >= 180 {
                 showCustomEffort = true
                 customEffort = advice.suggestedMinutes
@@ -551,7 +1055,8 @@ struct CaptureSheetView: View {
     private var schedulingOptionsDisclosure: some View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
-                withAnimation(.easeInOut(duration: 0.22)) {
+                UISelectionFeedbackGenerator().selectionChanged()
+                withAnimation(spatialAnimation) {
                     showSchedulingOptions.toggle()
                 }
             } label: {
@@ -590,6 +1095,7 @@ struct CaptureSheetView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .hearthPressStyle(scale: 0.985, pressedOpacity: 0.8)
             .accessibilityIdentifier("capture.moreSchedulingOptions")
             .accessibilityLabel(schedulingOptionsAccessibilityLabel)
             .accessibilityValue(showSchedulingOptions ? "Expanded" : "Collapsed")
@@ -608,7 +1114,11 @@ struct CaptureSheetView: View {
                 }
                 .padding(.horizontal, 14)
                 .padding(.bottom, 14)
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                .transition(
+                    reduceMotion
+                        ? .opacity
+                        : .opacity.combined(with: .move(edge: .top))
+                )
             }
         }
         .background(Color.filumaSurface)
@@ -641,17 +1151,11 @@ struct CaptureSheetView: View {
                 .font(AppFont.caption(12))
                 .foregroundStyle(Color.filumaSubtle)
 
-            HStack(spacing: 8) {
-                EffortChip(label: "Soon", isSelected: !useCustomStart) {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        useCustomStart = false
-                    }
-                }
-                EffortChip(label: "Pick a time", isSelected: useCustomStart) {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        useCustomStart = true
-                        customStart = max(customStart, Date())
-                    }
+            Group {
+                if dynamicTypeSize.isAccessibilitySize {
+                    VStack(spacing: 8) { startChoices }
+                } else {
+                    HStack(spacing: 8) { startChoices }
                 }
             }
 
@@ -665,6 +1169,8 @@ struct CaptureSheetView: View {
                 .datePickerStyle(.compact)
                 .labelsHidden()
                 .tint(Color.brand500)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
                 .accessibilityLabel("Earliest start")
                 .padding(.top, 4)
             } else {
@@ -675,124 +1181,201 @@ struct CaptureSheetView: View {
         }
     }
 
-    // MARK: - Schedule Button
-
-    private var scheduleButton: some View {
-        Button {
-            attemptSchedule()
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "calendar.badge.clock")
-                    .font(.system(size: 16, weight: .semibold))
-                Text("Schedule it")
+    @ViewBuilder
+    private var startChoices: some View {
+        EffortChip(
+            label: "Soon",
+            isSelected: !useCustomStart,
+            identifier: "capture.start.soon",
+            fillsWidth: dynamicTypeSize.isAccessibilitySize
+        ) {
+            UISelectionFeedbackGenerator().selectionChanged()
+            withAnimation(spatialAnimation) {
+                useCustomStart = false
             }
-            .primaryButtonStyle(enabled: !title.isEmpty)
         }
-        .disabled(title.isEmpty)
-        .padding(.top, 6)
+        EffortChip(
+            label: "Pick a time",
+            isSelected: useCustomStart,
+            identifier: "capture.start.custom",
+            fillsWidth: dynamicTypeSize.isAccessibilitySize
+        ) {
+            UISelectionFeedbackGenerator().selectionChanged()
+            withAnimation(spatialAnimation) {
+                useCustomStart = true
+                customStart = max(customStart, Date())
+            }
+        }
     }
 
     // MARK: - Scheduling Logic
 
     private func attemptSchedule() {
-        let settings = UserSettings.fetchOrCreate(in: modelContext)
-        let allBlocks = (try? modelContext.fetch(FetchDescriptor<ScheduledBlock>())) ?? []
-        let blockedTimes = (try? modelContext.fetch(FetchDescriptor<BlockedTime>())) ?? []
-        let busyEvents = (try? modelContext.fetch(FetchDescriptor<BusyEvent>())) ?? []
+        guard canSubmit else { return }
+        discardPending()
+        focusedField = nil
+        captureIssue = nil
+        isSubmitting = true
 
-        // Build without inserting — a cancelled warning must leave no trace.
-        let trimmedStep = firstStep.trimmingCharacters(in: .whitespaces)
-        let task = FilumaTask(
-            title: title,
-            context: context,
-            deadline: deadline,
-            effortMinutes: effortMinutes,
-            firstStep: trimmedStep.isEmpty ? nil : trimmedStep
-        )
+        let prepared: PreparedTaskCapture
+        do {
+            prepared = try CaptureCoordinator.prepareTask(
+                title: title,
+                firstStep: firstStep,
+                taskContext: context,
+                deadline: deadline,
+                effortMinutes: effortMinutes,
+                preferredStart: useCustomStart ? customStart : nil,
+                context: modelContext
+            )
+        } catch {
+            failCapture("Filuma couldn't read your plan yet. Your capture is still here—try again.")
+            return
+        }
 
-        // Never book work to start "right now" — leave the configured buffer,
-        // unless the user picked an explicit earliest start.
-        let earliestStart = useCustomStart
-            ? max(customStart, Date())
-            : Date().addingTimeInterval(TimeInterval(settings.startBufferMinutes * 60))
-
-        let result = SchedulerService.schedule(
-            task: task,
-            allBlocks: allBlocks,
-            blockedTimes: blockedTimes,
-            busyEvents: busyEvents,
-            settings: settings,
-            from: earliestStart
-        )
-
-        switch result {
+        pendingCapture = prepared
+        switch prepared.result {
         case .success(let blocks):
-            pendingTask = task
-            pendingBlocks = blocks
+            guard !blocks.isEmpty || effortMinutes == 0 else {
+                isSubmitting = false
+                scheduleWarning = "No open gaps appeared before your deadline. Make Room can rebuild the plan around this task, or you can adjust the deadline."
+                showWarning = true
+                return
+            }
             commitPending()
 
-        case .partialFit(let blocks, let unscheduledMinutes):
-            pendingTask = task
-            pendingBlocks = blocks
+        case .partialFit(_, let unscheduledMinutes):
+            isSubmitting = false
             let timeStr = CountdownFormatter.effortString(minutes: unscheduledMinutes)
             scheduleWarning = "\(timeStr) of effort couldn't fit in the open gaps before your deadline. Make Room moves later-deadline work aside; Save Anyway keeps the partial plan."
             showWarning = true
 
         case .noSlots:
-            pendingTask = task
-            pendingBlocks = []
+            isSubmitting = false
             scheduleWarning = "No open gaps before your deadline. Make Room moves later-deadline work aside, or extend the deadline."
             showWarning = true
         }
     }
 
     private func commitPending() {
-        guard let task = pendingTask else { return }
-        modelContext.insert(task)
-        for block in pendingBlocks {
-            modelContext.insert(block)
+        guard let pendingCapture else { return }
+        isSubmitting = true
+        do {
+            let receipt = try CaptureCoordinator.commit(
+                pendingCapture,
+                repeatWeeklyUntil: repeatWeekly ? repeatUntil : nil,
+                context: modelContext
+            )
+            self.pendingCapture = nil
+            finishTaskCapture(receipt)
+        } catch {
+            CaptureCoordinator.discard(pendingCapture)
+            self.pendingCapture = nil
+            failCapture("Filuma couldn't save this task yet. Your words are still here—try again.")
         }
-        insertTemplateIfRepeating(for: task)
-        pendingTask = nil
-        pendingBlocks = []
-        PlanCoordinator.publishChange(context: modelContext)
-        dismiss()
-    }
-
-    /// A weekly capture leaves a template behind; the foreground refresh
-    /// stamps out the future occurrences from it.
-    private func insertTemplateIfRepeating(for task: FilumaTask) {
-        guard repeatWeekly,
-              let nextDeadline = Calendar.current.date(byAdding: .day, value: 7, to: task.deadline),
-              nextDeadline <= repeatUntil else { return }
-        let template = TaskTemplate(
-            title: task.title,
-            context: task.context,
-            effortMinutes: task.effortMinutes,
-            firstStep: task.firstStep,
-            nextDeadline: nextDeadline,
-            repeatUntil: repeatUntil
-        )
-        modelContext.insert(template)
-        task.templateId = template.id
     }
 
     /// The new task doesn't fit in the gaps: commit it and rebuild the whole
     /// plan by deadline, letting it bump later-deadline work.
     private func makeRoom() {
-        guard let task = pendingTask else { return }
-        modelContext.insert(task)
-        insertTemplateIfRepeating(for: task)
-        pendingTask = nil
-        pendingBlocks = []
-
-        PlanCoordinator.rebuildPlan(context: modelContext)
-        dismiss()
+        guard let pendingCapture else { return }
+        isSubmitting = true
+        do {
+            let receipt = try CaptureCoordinator.commitMakingRoom(
+                pendingCapture,
+                repeatWeeklyUntil: repeatWeekly ? repeatUntil : nil,
+                context: modelContext
+            )
+            self.pendingCapture = nil
+            finishTaskCapture(receipt)
+        } catch {
+            CaptureCoordinator.discard(pendingCapture)
+            self.pendingCapture = nil
+            failCapture("Filuma couldn't rebuild your plan yet. Nothing was added—try again.")
+        }
     }
 
     private func discardPending() {
-        pendingTask = nil
-        pendingBlocks = []
+        guard let pendingCapture else { return }
+        CaptureCoordinator.discard(pendingCapture)
+        self.pendingCapture = nil
+        isSubmitting = false
+    }
+
+    private func finishTaskCapture(_ receipt: TaskCaptureReceipt) {
+        isSubmitting = false
+        captureSuccess = receipt.unscheduledMinutes > 0
+            ? "Task saved"
+            : "Added to your plan"
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        onTaskCaptured?(receipt)
+
+        let timing: String
+        if let firstBlockStart = receipt.firstBlockStart {
+            timing = ", starting \(firstBlockStart.formatted(date: .omitted, time: .shortened))"
+        } else if receipt.unscheduledMinutes > 0 {
+            timing = ", with \(CountdownFormatter.effortString(minutes: receipt.unscheduledMinutes)) still to place"
+        } else {
+            timing = ""
+        }
+        UIAccessibility.post(
+            notification: .announcement,
+            argument: "\(receipt.title) added to your plan\(timing)."
+        )
+
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(700))
+            guard isViewActive, captureSuccess != nil else { return }
+            dismiss()
+        }
+    }
+
+    private func saveReminder() {
+        guard canSubmit else { return }
+        focusedField = nil
+        captureIssue = nil
+        isSubmitting = true
+
+        let receipt: ReminderCaptureReceipt
+        do {
+            receipt = try CaptureCoordinator.saveReminder(
+                title: title,
+                dueDate: reminderDate,
+                context: modelContext
+            )
+        } catch {
+            failCapture("Filuma couldn't save this reminder yet. Your words are still here—try again.")
+            return
+        }
+
+        onReminderCaptured?(receipt)
+        Task { @MainActor in
+            let granted = await NotificationService.requestAuthorization()
+            guard isViewActive else { return }
+
+            isSubmitting = false
+            captureSuccess = "Reminder saved"
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            UIAccessibility.post(
+                notification: .announcement,
+                argument: "\(receipt.title) saved for \(receipt.dueDate.formatted(date: .abbreviated, time: .shortened))."
+            )
+
+            guard granted else {
+                showNotificationsDeniedNote = true
+                return
+            }
+            NotificationService.schedule(receipt: receipt)
+            try? await Task.sleep(for: .milliseconds(700))
+            guard isViewActive else { return }
+            dismiss()
+        }
+    }
+
+    private func failCapture(_ message: String) {
+        isSubmitting = false
+        captureIssue = message
+        UINotificationFeedbackGenerator().notificationOccurred(.error)
     }
 
     private static func defaultDeadline() -> Date {
@@ -815,43 +1398,52 @@ struct CaptureSheetView: View {
             return
         }
 
+        let authorizationID = UUID()
+        activeVoiceAuthorizationID = authorizationID
         SFSpeechRecognizer.requestAuthorization { status in
             DispatchQueue.main.async {
-                // Don't open the microphone if the user has left for another
-                // app while the permission dialog sat waiting. (`.inactive`
-                // must stay allowed — the dialog itself holds the scene there
-                // while this callback races the grant tap.)
-                guard scenePhase != .background else { return }
+                guard isViewActive,
+                      activeVoiceAuthorizationID == authorizationID,
+                      scenePhase != .background else { return }
 
                 switch status {
                 case .authorized:
-                    requestMicrophoneAccess()
+                    requestMicrophoneAccess(authorizationID: authorizationID)
                 case .denied, .restricted:
+                    activeVoiceAuthorizationID = nil
                     voiceInputIssue = .speechPermission
                 case .notDetermined:
+                    activeVoiceAuthorizationID = nil
                     voiceInputIssue = .recognizerUnavailable
                 @unknown default:
+                    activeVoiceAuthorizationID = nil
                     voiceInputIssue = .recognizerUnavailable
                 }
             }
         }
     }
 
-    private func requestMicrophoneAccess() {
+    private func requestMicrophoneAccess(authorizationID: UUID) {
         AVAudioApplication.requestRecordPermission { granted in
             DispatchQueue.main.async {
-                guard scenePhase != .background else { return }
+                guard isViewActive,
+                      activeVoiceAuthorizationID == authorizationID,
+                      scenePhase != .background else { return }
                 guard granted else {
+                    activeVoiceAuthorizationID = nil
                     voiceInputIssue = .microphonePermission
                     return
                 }
-                beginRecognition()
+                beginRecognition(authorizationID: authorizationID)
             }
         }
     }
 
-    private func beginRecognition() {
+    private func beginRecognition(authorizationID: UUID) {
+        guard isViewActive,
+              activeVoiceAuthorizationID == authorizationID else { return }
         guard let speechRecognizer, speechRecognizer.isAvailable else {
+            activeVoiceAuthorizationID = nil
             voiceInputIssue = .recognizerUnavailable
             return
         }
@@ -861,6 +1453,7 @@ struct CaptureSheetView: View {
             try session.setCategory(.record, mode: .measurement, options: .duckOthers)
             try session.setActive(true, options: .notifyOthersOnDeactivation)
         } catch {
+            activeVoiceAuthorizationID = nil
             voiceInputIssue = .audioUnavailable
             return
         }
@@ -874,25 +1467,30 @@ struct CaptureSheetView: View {
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
             request.append(buffer)
         }
+        hasInstalledAudioTap = true
 
         audioEngine.prepare()
         do {
             try audioEngine.start()
         } catch {
             inputNode.removeTap(onBus: 0)
+            hasInstalledAudioTap = false
             request.endAudio()
             recognitionRequest = nil
+            activeVoiceAuthorizationID = nil
             try? session.setActive(false, options: .notifyOthersOnDeactivation)
             voiceInputIssue = .audioUnavailable
             return
         }
+        activeVoiceAuthorizationID = nil
         isListening = true
 
         let recognitionID = UUID()
         activeRecognitionID = recognitionID
         recognitionTask = speechRecognizer.recognitionTask(with: request) { result, error in
             DispatchQueue.main.async {
-                guard activeRecognitionID == recognitionID else { return }
+                guard isViewActive,
+                      activeRecognitionID == recognitionID else { return }
 
                 if let result {
                     title = result.bestTranscription.formattedString
@@ -909,9 +1507,13 @@ struct CaptureSheetView: View {
     }
 
     private func stopListening() {
+        activeVoiceAuthorizationID = nil
         activeRecognitionID = nil
         audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
+        if hasInstalledAudioTap {
+            audioEngine.inputNode.removeTap(onBus: 0)
+            hasInstalledAudioTap = false
+        }
         recognitionRequest?.endAudio()
         recognitionRequest = nil
         recognitionTask?.cancel()
@@ -975,21 +1577,25 @@ private enum VoiceInputIssue: String, Identifiable {
 private struct EffortChip: View {
     let label: String
     let isSelected: Bool
+    let identifier: String
+    let fillsWidth: Bool
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
             Text(label)
                 .font(AppFont.caption(12))
-                .foregroundStyle(isSelected ? .white : Color.filumaText)
+                .foregroundStyle(isSelected ? Color.filumaControlInk : Color.filumaText)
                 .padding(.horizontal, 14)
-                .padding(.vertical, 9)
+                .frame(maxWidth: fillsWidth ? .infinity : nil, minHeight: 44)
                 .background(
                     Capsule()
-                        .fill(isSelected ? Color.brand500 : Color.filumaSurface2)
+                        .fill(isSelected ? Color.brand100 : Color.filumaSurface2)
                 )
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+        .accessibilityIdentifier(identifier)
     }
 }

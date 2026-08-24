@@ -56,6 +56,464 @@ final class FilumaTests: XCTestCase {
         }
     }
 
+    private func assertFreshSchedulingDefaults(
+        _ settings: UserSettings,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertEqual(settings.wakeHour, 8, file: file, line: line)
+        XCTAssertEqual(settings.wakeMinute, 0, file: file, line: line)
+        XCTAssertEqual(settings.sleepHour, 23, file: file, line: line)
+        XCTAssertEqual(settings.sleepMinute, 0, file: file, line: line)
+        XCTAssertEqual(settings.minBlockMinutes, 30, file: file, line: line)
+        XCTAssertEqual(settings.maxBlockMinutes, 90, file: file, line: line)
+        XCTAssertEqual(settings.deadlineBufferMinutes, 120, file: file, line: line)
+        XCTAssertEqual(settings.startBufferMinutes, 15, file: file, line: line)
+        XCTAssertFalse(settings.planningRebuildPending, file: file, line: line)
+    }
+
+    // MARK: - User settings defaults
+
+    func testFreshUserSettingsUsesCanonicalSchedulingDefaults() {
+        let defaults = UserSettingsSchedulingDefaults.fresh
+
+        XCTAssertEqual(defaults.wakeHour, 8)
+        XCTAssertEqual(defaults.wakeMinute, 0)
+        XCTAssertEqual(defaults.sleepHour, 23)
+        XCTAssertEqual(defaults.sleepMinute, 0)
+        XCTAssertEqual(defaults.minBlockMinutes, 30)
+        XCTAssertEqual(defaults.maxBlockMinutes, 90)
+        XCTAssertEqual(defaults.deadlineBufferMinutes, 120)
+        XCTAssertEqual(defaults.startBufferMinutes, 15)
+        assertFreshSchedulingDefaults(UserSettings())
+    }
+
+    func testReapplyingFreshSchedulingDefaultsRestoresTheSamePolicyOnly() {
+        let settings = UserSettings()
+        settings.wakeHour = 5
+        settings.wakeMinute = 45
+        settings.sleepHour = 1
+        settings.sleepMinute = 15
+        settings.minBlockMinutes = 10
+        settings.maxBlockMinutes = 240
+        settings.deadlineBufferMinutes = 0
+        settings.startBufferMinutes = 90
+        settings.hasCompletedOnboarding = true
+        settings.blockRemindersEnabled = false
+
+        settings.applyRecommendedSchedulingDefaults()
+
+        assertFreshSchedulingDefaults(settings)
+        XCTAssertTrue(settings.hasCompletedOnboarding)
+        XCTAssertFalse(settings.blockRemindersEnabled)
+    }
+
+    // MARK: - Settings side-effect durability
+
+    @MainActor
+    func testNudgePreferenceCommitsBeforeNotificationReconcile() throws {
+        let settings = makeSettings()
+        try context.save()
+        var saveFinished = false
+        var reconcileCount = 0
+
+        try BlockNotificationService.updatePreference(
+            .eveningReviewTime(hour: 19, minute: 45),
+            settings: settings,
+            context: context,
+            save: { context in
+                try context.save()
+                saveFinished = true
+            },
+            reconcile: { _ in
+                reconcileCount += 1
+                XCTAssertTrue(saveFinished, "external reconciliation must follow the durable save")
+                let fresh = ModelContext(self.container)
+                let durable = try? fresh.fetch(FetchDescriptor<UserSettings>())
+                XCTAssertEqual(durable?.first?.eveningReviewHour, 19)
+                XCTAssertEqual(durable?.first?.eveningReviewMinute, 45)
+            }
+        )
+
+        XCTAssertEqual(reconcileCount, 1)
+    }
+
+    @MainActor
+    func testNudgePreferenceFailureRepairsHeldFieldsPreservesPreflightAndRetries() throws {
+        let settings = makeSettings()
+        settings.blockRemindersEnabled = true
+        settings.blockReminderLeadMinutes = 10
+        settings.morningPreviewEnabled = false
+        settings.eveningReviewEnabled = true
+        settings.eveningReviewHour = 20
+        settings.eveningReviewMinute = 15
+        let unrelated = makeTask(effort: 30, deadlineHoursFromAnchor: 24)
+        try context.save()
+        unrelated.title = "Accepted by preflight"
+        var reconcileCount = 0
+
+        XCTAssertThrowsError(
+            try BlockNotificationService.updatePreference(
+                .eveningReviewTime(hour: 6, minute: 45),
+                settings: settings,
+                context: context,
+                save: { _ in throw CocoaError(.fileWriteUnknown) },
+                reconcile: { _ in reconcileCount += 1 }
+            )
+        )
+
+        XCTAssertTrue(settings.blockRemindersEnabled)
+        XCTAssertEqual(settings.blockReminderLeadMinutes, 10)
+        XCTAssertFalse(settings.morningPreviewEnabled)
+        XCTAssertTrue(settings.eveningReviewEnabled)
+        XCTAssertEqual(settings.eveningReviewHour, 20)
+        XCTAssertEqual(settings.eveningReviewMinute, 15)
+        XCTAssertEqual(reconcileCount, 0)
+
+        var fresh = ModelContext(container)
+        var durableSettings = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        let durableTask = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<FilumaTask>()).first { $0.id == unrelated.id }
+        )
+        XCTAssertEqual(durableTask.title, "Accepted by preflight")
+        XCTAssertEqual(durableSettings.eveningReviewHour, 20)
+        XCTAssertEqual(durableSettings.eveningReviewMinute, 15)
+
+        try BlockNotificationService.updatePreference(
+            .eveningReviewTime(hour: 6, minute: 45),
+            settings: settings,
+            context: context,
+            reconcile: { _ in reconcileCount += 1 }
+        )
+
+        XCTAssertEqual(reconcileCount, 1)
+        fresh = ModelContext(container)
+        durableSettings = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        XCTAssertEqual(durableSettings.eveningReviewHour, 6)
+        XCTAssertEqual(durableSettings.eveningReviewMinute, 45)
+    }
+
+    @MainActor
+    func testAppleExportPreferenceCommitRollsBackFailureAndRetriesDurably() throws {
+        let settings = makeSettings()
+        try context.save()
+
+        try CalendarExportService.setExportEnabled(
+            true,
+            settings: settings,
+            context: context
+        )
+        XCTAssertTrue(settings.exportToAppleCalendar)
+        var fresh = ModelContext(container)
+        XCTAssertTrue(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        ).exportToAppleCalendar)
+
+        XCTAssertThrowsError(
+            try CalendarExportService.setExportEnabled(
+                false,
+                settings: settings,
+                context: context,
+                save: { _ in throw CocoaError(.fileWriteUnknown) }
+            )
+        )
+        XCTAssertTrue(settings.exportToAppleCalendar)
+        fresh = ModelContext(container)
+        XCTAssertTrue(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        ).exportToAppleCalendar)
+
+        try CalendarExportService.setExportEnabled(
+            false,
+            settings: settings,
+            context: context
+        )
+        XCTAssertFalse(settings.exportToAppleCalendar)
+        fresh = ModelContext(container)
+        XCTAssertFalse(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        ).exportToAppleCalendar)
+    }
+
+    @MainActor
+    func testCalendarIdentifierMirrorRepairsAllFieldsAndRetriesInSameContext() throws {
+        let settings = makeSettings()
+        settings.filumaCalendarIdentifier = "calendar-held"
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 24)
+        let first = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 30)
+        let second = ScheduledBlock(
+            task: task,
+            startTime: anchor.addingTimeInterval(3600),
+            durationMinutes: 30
+        )
+        first.appleCalendarEventId = "event-held-1"
+        second.appleCalendarEventId = "event-held-2"
+        context.insert(first)
+        context.insert(second)
+        try context.save()
+
+        try CalendarExportService.persistExportIdentifiers(
+            calendarIdentifier: "calendar-committed",
+            blockIdentifiers: [
+                (block: first, identifier: "event-committed-1"),
+                (block: second, identifier: "event-committed-2")
+            ],
+            settings: settings,
+            context: context
+        )
+
+        var fresh = ModelContext(container)
+        var durableSettings = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        var durableIDs = Dictionary(uniqueKeysWithValues:
+            try fresh.fetch(FetchDescriptor<ScheduledBlock>()).map {
+                ($0.id, $0.appleCalendarEventId)
+            }
+        )
+        XCTAssertEqual(durableSettings.filumaCalendarIdentifier, "calendar-committed")
+        XCTAssertEqual(durableIDs[first.id]!, "event-committed-1")
+        XCTAssertEqual(durableIDs[second.id]!, "event-committed-2")
+
+        task.title = "Preflight survives identifier rollback"
+        XCTAssertThrowsError(
+            try CalendarExportService.persistExportIdentifiers(
+                calendarIdentifier: "calendar-rejected",
+                blockIdentifiers: [
+                    (block: first, identifier: "event-rejected-1"),
+                    (block: second, identifier: nil)
+                ],
+                settings: settings,
+                context: context,
+                save: { _ in throw CocoaError(.fileWriteUnknown) }
+            )
+        )
+
+        XCTAssertEqual(settings.filumaCalendarIdentifier, "calendar-committed")
+        XCTAssertEqual(first.appleCalendarEventId, "event-committed-1")
+        XCTAssertEqual(second.appleCalendarEventId, "event-committed-2")
+        fresh = ModelContext(container)
+        durableSettings = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        durableIDs = Dictionary(uniqueKeysWithValues:
+            try fresh.fetch(FetchDescriptor<ScheduledBlock>()).map {
+                ($0.id, $0.appleCalendarEventId)
+            }
+        )
+        XCTAssertEqual(durableSettings.filumaCalendarIdentifier, "calendar-committed")
+        XCTAssertEqual(durableIDs[first.id]!, "event-committed-1")
+        XCTAssertEqual(durableIDs[second.id]!, "event-committed-2")
+        XCTAssertEqual(
+            try XCTUnwrap(fresh.fetch(FetchDescriptor<FilumaTask>()).first).title,
+            "Preflight survives identifier rollback"
+        )
+
+        try CalendarExportService.persistExportIdentifiers(
+            calendarIdentifier: "calendar-retried",
+            blockIdentifiers: [
+                (block: first, identifier: "event-retried-1"),
+                (block: second, identifier: nil)
+            ],
+            settings: settings,
+            context: context
+        )
+        fresh = ModelContext(container)
+        durableSettings = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        durableIDs = Dictionary(uniqueKeysWithValues:
+            try fresh.fetch(FetchDescriptor<ScheduledBlock>()).map {
+                ($0.id, $0.appleCalendarEventId)
+            }
+        )
+        XCTAssertEqual(durableSettings.filumaCalendarIdentifier, "calendar-retried")
+        XCTAssertEqual(durableIDs[first.id]!, "event-retried-1")
+        XCTAssertNil(durableIDs[second.id]!)
+    }
+
+    func testAppleExportReconcileRejectsStaleRequestOrDurableToggle() {
+        let captured = UUID()
+
+        XCTAssertTrue(CalendarExportService.isReconciliationCurrent(
+            expectedEnabled: true,
+            durableEnabled: true,
+            requestID: captured,
+            currentRequestID: captured
+        ))
+        XCTAssertFalse(CalendarExportService.isReconciliationCurrent(
+            expectedEnabled: true,
+            durableEnabled: false,
+            requestID: captured,
+            currentRequestID: captured
+        ), "a captured enable retry must stop after the durable toggle flips off")
+        XCTAssertFalse(CalendarExportService.isReconciliationCurrent(
+            expectedEnabled: true,
+            durableEnabled: true,
+            requestID: captured,
+            currentRequestID: UUID()
+        ), "an older request must not reconcile after a newer Settings action")
+    }
+
+    @MainActor
+    func testOnboardingBootstrapFailureCanRetryWithoutDuplicateSettings() throws {
+        var rejectedSaveCount = 0
+
+        XCTAssertThrowsError(
+            try OnboardingBootstrapCoordinator.ensureSettings(
+                in: context,
+                save: { _ in
+                    rejectedSaveCount += 1
+                    throw CocoaError(.fileWriteUnknown)
+                }
+            )
+        )
+        XCTAssertEqual(rejectedSaveCount, 1)
+
+        context.rollback()
+        context.processPendingChanges()
+
+        let settings = try OnboardingBootstrapCoordinator.ensureSettings(
+            in: context
+        )
+        let stored = try context.fetch(FetchDescriptor<UserSettings>())
+        XCTAssertEqual(stored.count, 1)
+        XCTAssertEqual(stored.first?.id, settings.id)
+        assertFreshSchedulingDefaults(settings)
+    }
+
+    @MainActor
+    func testOnboardingBootstrapReadFailureCannotCreateDuplicateSettings() throws {
+        let original = makeSettings()
+        try context.save()
+        var saveCount = 0
+
+        XCTAssertThrowsError(
+            try OnboardingBootstrapCoordinator.ensureSettings(
+                in: context,
+                fetch: { _ in throw CocoaError(.fileReadUnknown) },
+                save: { context in
+                    saveCount += 1
+                    try context.save()
+                }
+            )
+        )
+
+        XCTAssertEqual(saveCount, 0)
+        let durable = ModelContext(container)
+        let stored = try durable.fetch(FetchDescriptor<UserSettings>())
+        XCTAssertEqual(stored.count, 1)
+        XCTAssertEqual(stored.first?.id, original.id)
+
+        let retried = try OnboardingBootstrapCoordinator.ensureSettings(in: context)
+        XCTAssertEqual(retried.id, original.id)
+    }
+
+    @MainActor
+    func testExistingTaskReadFailureCannotChooseFirstRunPath() throws {
+        _ = makeTask(effort: 60, deadlineHoursFromAnchor: 24)
+        try context.save()
+
+        XCTAssertThrowsError(
+            try OnboardingBootstrapCoordinator.hasExistingTasks(
+                in: context,
+                fetchCount: { _ in throw CocoaError(.fileReadUnknown) }
+            )
+        )
+        XCTAssertTrue(
+            try OnboardingBootstrapCoordinator.hasExistingTasks(in: context)
+        )
+    }
+
+    @MainActor
+    func testOnboardingCompletionFirstSaveFailureKeepsDraftForRetry() throws {
+        let settings = makeSettings()
+        try context.save()
+        settings.wakeHour = 6
+        settings.wakeMinute = 45
+        settings.minBlockMinutes = 45
+        settings.maxBlockMinutes = 120
+        settings.deadlineBufferMinutes = 180
+
+        XCTAssertThrowsError(
+            try OnboardingCompletionCoordinator.commit(
+                settings,
+                in: context,
+                save: { _ in throw CocoaError(.fileWriteUnknown) }
+            )
+        )
+
+        XCTAssertFalse(settings.hasCompletedOnboarding)
+        XCTAssertEqual(settings.wakeHour, 6)
+        XCTAssertEqual(settings.wakeMinute, 45)
+        XCTAssertEqual(settings.minBlockMinutes, 45)
+        XCTAssertEqual(settings.maxBlockMinutes, 120)
+        XCTAssertEqual(settings.deadlineBufferMinutes, 180)
+
+        let beforeRetry = ModelContext(container)
+        let durableBeforeRetry = try XCTUnwrap(
+            beforeRetry.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        XCTAssertFalse(durableBeforeRetry.hasCompletedOnboarding)
+        XCTAssertEqual(durableBeforeRetry.wakeHour, 8)
+
+        try OnboardingCompletionCoordinator.commit(settings, in: context)
+
+        let afterRetry = ModelContext(container)
+        let durableAfterRetry = try XCTUnwrap(
+            afterRetry.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        XCTAssertTrue(durableAfterRetry.hasCompletedOnboarding)
+        XCTAssertEqual(durableAfterRetry.wakeHour, 6)
+        XCTAssertEqual(durableAfterRetry.wakeMinute, 45)
+        XCTAssertEqual(durableAfterRetry.minBlockMinutes, 45)
+        XCTAssertEqual(durableAfterRetry.maxBlockMinutes, 120)
+        XCTAssertEqual(durableAfterRetry.deadlineBufferMinutes, 180)
+    }
+
+    @MainActor
+    func testOnboardingCompletionFinalSaveFailureKeepsRhythmButNotHandoff() throws {
+        let settings = makeSettings()
+        try context.save()
+        settings.sleepHour = 1
+        settings.sleepMinute = 15
+        settings.minBlockMinutes = 60
+        settings.maxBlockMinutes = 150
+        settings.deadlineBufferMinutes = 240
+        var saveCount = 0
+
+        XCTAssertThrowsError(
+            try OnboardingCompletionCoordinator.commit(
+                settings,
+                in: context,
+                save: { context in
+                    saveCount += 1
+                    if saveCount == 2 {
+                        throw CocoaError(.fileWriteUnknown)
+                    }
+                    try context.save()
+                }
+            )
+        )
+
+        XCTAssertEqual(saveCount, 2)
+        XCTAssertFalse(settings.hasCompletedOnboarding)
+        let durable = ModelContext(container)
+        let stored = try XCTUnwrap(
+            durable.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        XCTAssertFalse(stored.hasCompletedOnboarding)
+        XCTAssertEqual(stored.sleepHour, 1)
+        XCTAssertEqual(stored.sleepMinute, 15)
+        XCTAssertEqual(stored.minBlockMinutes, 60)
+        XCTAssertEqual(stored.maxBlockMinutes, 150)
+        XCTAssertEqual(stored.deadlineBufferMinutes, 240)
+    }
+
     // MARK: - splitEffort
 
     func testSplitEffortRespectsBounds() {
@@ -1064,6 +1522,32 @@ final class FilumaTests: XCTestCase {
         XCTAssertEqual(reversed.id, earlier.id)
     }
 
+    func testWorkSessionReceiptNeverClaimsASubSecondSessionWasLogged() {
+        let copy = WorkSessionReceiptCopy.make(
+            loggedSeconds: 0,
+            scheduledBlock: true
+        )
+
+        XCTAssertEqual(copy.eyebrow, "THREAD OPEN")
+        XCTAssertEqual(copy.title, "Session ended")
+        XCTAssertEqual(copy.durationLabel, "No time added")
+        XCTAssertEqual(copy.detailLabel, "Your task and schedule are unchanged")
+        XCTAssertFalse(copy.message.contains("safely banked"))
+    }
+
+    func testWorkSessionReceiptDescribesRecordedTimeWithoutOverclaimingAttendance() {
+        let copy = WorkSessionReceiptCopy.make(
+            loggedSeconds: 37,
+            scheduledBlock: true
+        )
+
+        XCTAssertEqual(copy.eyebrow, "THREAD HELD")
+        XCTAssertEqual(copy.title, "Session logged")
+        XCTAssertEqual(copy.durationLabel, "00:37")
+        XCTAssertEqual(copy.detailLabel, "Time logged to scheduled block")
+        XCTAssertFalse(copy.detailLabel.contains("fulfilled"))
+    }
+
     // MARK: - Shared work-session clock
 
     func testWorkSessionControlStateDecodesLegacyJournal() throws {
@@ -1200,6 +1684,50 @@ final class FilumaTests: XCTestCase {
         let data = try JSONEncoder().encode(state)
         let decoded = try JSONDecoder().decode(WorkSessionControlState.self, from: data)
         XCTAssertEqual(decoded, state)
+    }
+
+    func testIdleWorkSessionDismissalDoesNotOwnAttendanceOrTeardown() {
+        XCTAssertFalse(
+            WorkSessionDismissalPolicy.shouldRecord(localSessionID: nil),
+            "presenting and dismissing an unstarted task must not enter the attendance or shared teardown path"
+        )
+        XCTAssertTrue(
+            WorkSessionDismissalPolicy.shouldRecord(localSessionID: UUID()),
+            "a locally started or recovered session still records through the durable dismissal path"
+        )
+    }
+
+    @MainActor
+    func testSessionScopedTeardownPreservesForeignJournalAndClearsMatchingJournal() {
+        let original = WorkSessionControlStore.load()
+        defer {
+            WorkSessionControlStore.clear()
+            if let original {
+                WorkSessionControlStore.save(original)
+            }
+        }
+
+        let taskAID = UUID()
+        let sessionAID = UUID()
+        let foreignJournal = WorkSessionControlState(
+            sessionID: sessionAID,
+            startedAt: anchor.addingTimeInterval(-60),
+            taskID: taskAID
+        )
+        WorkSessionControlStore.save(foreignJournal)
+
+        WorkSessionActivityController.end(sessionID: UUID())
+        XCTAssertEqual(
+            WorkSessionControlStore.load(),
+            foreignJournal,
+            "a stale task B view must not clear task A's active recovery journal"
+        )
+
+        WorkSessionActivityController.end(sessionID: sessionAID)
+        XCTAssertNil(
+            WorkSessionControlStore.load(),
+            "the task that owns the active session must still clear its journal after durable stop"
+        )
     }
 
     // MARK: - Start rounding & buffer
@@ -2307,6 +2835,180 @@ final class FilumaTests: XCTestCase {
         XCTAssertTrue(remaining.isEmpty, "an exhausted template deletes itself")
     }
 
+    @MainActor
+    func testStopRepeatingDurablyDeletesTemplateAndClearsEveryOccurrence() throws {
+        let template = TaskTemplate(
+            title: "Weekly reading",
+            context: .school,
+            effortMinutes: 45,
+            nextDeadline: anchor.addingTimeInterval(7 * 86_400),
+            repeatUntil: anchor.addingTimeInterval(60 * 86_400)
+        )
+        let first = makeTask(effort: 45, deadlineHoursFromAnchor: 24)
+        let second = makeTask(effort: 45, deadlineHoursFromAnchor: 48)
+        let unrelated = makeTask(effort: 30, deadlineHoursFromAnchor: 72)
+        first.templateId = template.id
+        second.templateId = template.id
+        let unrelatedMarker = UUID()
+        unrelated.templateId = unrelatedMarker
+        context.insert(template)
+        try context.save()
+
+        var finalSaveFinished = false
+        var publishCount = 0
+        try PlanCoordinator.stopRepeating(
+            templateID: template.id,
+            context: context,
+            save: { context in
+                try context.save()
+                finalSaveFinished = true
+            },
+            publish: { _, _ in
+                XCTAssertTrue(finalSaveFinished, "publish must follow the durable save")
+                publishCount += 1
+            }
+        )
+
+        XCTAssertNil(first.templateId)
+        XCTAssertNil(second.templateId)
+        XCTAssertEqual(unrelated.templateId, unrelatedMarker)
+        XCTAssertEqual(publishCount, 1)
+
+        let fresh = ModelContext(container)
+        XCTAssertFalse(
+            try fresh.fetch(FetchDescriptor<TaskTemplate>()).contains { $0.id == template.id }
+        )
+        let durableTasks = try fresh.fetch(FetchDescriptor<FilumaTask>())
+        XCTAssertNil(durableTasks.first { $0.id == first.id }?.templateId)
+        XCTAssertNil(durableTasks.first { $0.id == second.id }?.templateId)
+        XCTAssertEqual(
+            durableTasks.first { $0.id == unrelated.id }?.templateId,
+            unrelatedMarker
+        )
+    }
+
+    @MainActor
+    func testStopRepeatingSaveFailureRestoresHeldAndDurableRecurrenceForRetry() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let template = TaskTemplate(
+            title: "Weekly review",
+            context: .work,
+            effortMinutes: 30,
+            nextDeadline: anchor.addingTimeInterval(7 * 86_400),
+            repeatUntil: anchor.addingTimeInterval(60 * 86_400)
+        )
+        let first = makeTask(effort: 30, deadlineHoursFromAnchor: 24)
+        let second = makeTask(effort: 30, deadlineHoursFromAnchor: 48)
+        first.templateId = template.id
+        second.templateId = template.id
+        context.insert(template)
+        try context.save()
+
+        var publishCount = 0
+        XCTAssertThrowsError(
+            try PlanCoordinator.stopRepeating(
+                templateID: template.id,
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _, _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(first.templateId, template.id)
+        XCTAssertEqual(second.templateId, template.id)
+        XCTAssertTrue(
+            try context.fetch(FetchDescriptor<TaskTemplate>()).contains { $0.id == template.id }
+        )
+        XCTAssertEqual(publishCount, 0)
+
+        let fresh = ModelContext(container)
+        XCTAssertTrue(
+            try fresh.fetch(FetchDescriptor<TaskTemplate>()).contains { $0.id == template.id }
+        )
+        let durableTasks = try fresh.fetch(FetchDescriptor<FilumaTask>())
+        XCTAssertEqual(durableTasks.first { $0.id == first.id }?.templateId, template.id)
+        XCTAssertEqual(durableTasks.first { $0.id == second.id }?.templateId, template.id)
+
+        try PlanCoordinator.stopRepeating(
+            templateID: template.id,
+            context: context,
+            interactive: false,
+            publish: { _, _ in publishCount += 1 }
+        )
+        XCTAssertNil(first.templateId)
+        XCTAssertNil(second.templateId)
+        XCTAssertEqual(publishCount, 1)
+
+        let afterRetry = ModelContext(container)
+        XCTAssertFalse(
+            try afterRetry.fetch(FetchDescriptor<TaskTemplate>())
+                .contains { $0.id == template.id }
+        )
+        let retryTasks = try afterRetry.fetch(FetchDescriptor<FilumaTask>())
+        XCTAssertNil(retryTasks.first { $0.id == first.id }?.templateId)
+        XCTAssertNil(retryTasks.first { $0.id == second.id }?.templateId)
+    }
+
+    @MainActor
+    func testStopRepeatingReadFailureLeavesEverythingUntouched() throws {
+        enum ExpectedFailure: Error { case fetch }
+
+        let template = TaskTemplate(
+            title: "Weekly planning",
+            context: .personal,
+            effortMinutes: 30,
+            nextDeadline: anchor.addingTimeInterval(7 * 86_400),
+            repeatUntil: anchor.addingTimeInterval(60 * 86_400)
+        )
+        let task = makeTask(effort: 30, deadlineHoursFromAnchor: 24)
+        task.templateId = template.id
+        context.insert(template)
+        try context.save()
+
+        var saveCount = 0
+        var publishCount = 0
+        XCTAssertThrowsError(
+            try PlanCoordinator.stopRepeating(
+                templateID: template.id,
+                context: context,
+                load: { _, _ in throw ExpectedFailure.fetch },
+                save: { _ in saveCount += 1 },
+                publish: { _, _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(task.templateId, template.id)
+        XCTAssertTrue(
+            try context.fetch(FetchDescriptor<TaskTemplate>()).contains { $0.id == template.id }
+        )
+        XCTAssertEqual(saveCount, 0)
+        XCTAssertEqual(publishCount, 0)
+    }
+
+    @MainActor
+    func testStopRepeatingClearsStaleMarkersWhenTemplateAlreadyRetired() throws {
+        let staleTemplateID = UUID()
+        let task = makeTask(effort: 30, deadlineHoursFromAnchor: 24)
+        task.templateId = staleTemplateID
+        try context.save()
+
+        var publishCount = 0
+        try PlanCoordinator.stopRepeating(
+            templateID: staleTemplateID,
+            context: context,
+            publish: { _, _ in publishCount += 1 }
+        )
+
+        XCTAssertNil(task.templateId)
+        XCTAssertEqual(publishCount, 1)
+        let fresh = ModelContext(container)
+        XCTAssertNil(
+            try fresh.fetch(FetchDescriptor<FilumaTask>())
+                .first { $0.id == task.id }?.templateId
+        )
+    }
+
     // MARK: - Weave
 
     func testWeaveAggregatesSessionsAndCheckedBlocksByDay() throws {
@@ -2432,6 +3134,50 @@ final class FilumaTests: XCTestCase {
         }
     }
 
+    func testRescheduleCountsFutureLockBeforeCustomStartWithoutMovingIt() throws {
+        let settings = makeSettings()
+        settings.startBufferMinutes = 0
+        settings.deadlineBufferMinutes = 0
+        let task = makeTask(effort: 120, deadlineHoursFromAnchor: 72)
+        let locked = ScheduledBlock(
+            task: task,
+            startTime: anchor.addingTimeInterval(60 * 60),
+            durationMinutes: 60
+        )
+        locked.isLocked = true
+        let movable = ScheduledBlock(
+            task: task,
+            startTime: anchor.addingTimeInterval(3 * 3600),
+            durationMinutes: 60
+        )
+        context.insert(locked)
+        context.insert(movable)
+        try context.save()
+        let customStart = anchor.addingTimeInterval(24 * 3600)
+
+        let result = SchedulerService.reschedule(
+            task: task,
+            allBlocks: [locked, movable],
+            settings: settings,
+            from: customStart,
+            now: anchor,
+            context: context
+        )
+        try context.save()
+
+        guard case .success(let replacements) = result else {
+            return XCTFail("expected the uncovered remainder to fit, got \(result)")
+        }
+        XCTAssertEqual(replacements.reduce(0) { $0 + $1.durationMinutes }, 60)
+        XCTAssertTrue(replacements.allSatisfy { $0.startTime >= customStart })
+        let durable = try context.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == task.id && !$0.isComplete
+        }
+        XCTAssertTrue(durable.contains { $0.id == locked.id })
+        XCTAssertFalse(durable.contains { $0.id == movable.id })
+        XCTAssertEqual(durable.reduce(0) { $0 + $1.durationMinutes }, 120)
+    }
+
     // MARK: - Plan coordinator
 
     @MainActor
@@ -2449,7 +3195,7 @@ final class FilumaTests: XCTestCase {
         try context.save()
 
         task.manualProgressPercent = 50
-        PlanCoordinator.reconcileTaskAfterProgress(
+        try PlanCoordinator.reconcileTaskAfterProgress(
             task,
             context: context,
             interactive: false
@@ -2484,7 +3230,7 @@ final class FilumaTests: XCTestCase {
         try context.save()
 
         task.manualProgressPercent = 50
-        PlanCoordinator.reconcileTaskAfterProgress(
+        try PlanCoordinator.reconcileTaskAfterProgress(
             task,
             context: context,
             interactive: false
@@ -2529,6 +3275,7 @@ final class FilumaTests: XCTestCase {
             allBlocks: [locked, movable],
             settings: settings,
             from: anchor,
+            now: anchor,
             context: context
         )
         try context.save()
@@ -2697,7 +3444,7 @@ final class FilumaTests: XCTestCase {
         try context.save()
 
         attended.isComplete = true
-        let result = PlanCoordinator.reconcileTaskAfterProgress(
+        let result = try PlanCoordinator.reconcileTaskAfterProgress(
             task,
             context: context,
             interactive: false
@@ -2721,6 +3468,156 @@ final class FilumaTests: XCTestCase {
     }
 
     @MainActor
+    func testAttendanceReconciliationPublishesOnlyAfterReplacementPlanIsDurable() throws {
+        _ = makeSettings()
+        let task = makeTask(effort: 120, deadlineHoursFromAnchor: 72)
+        let attended = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 60)
+        let existingFuture = ScheduledBlock(
+            task: task,
+            startTime: anchor.addingTimeInterval(2 * 3600),
+            durationMinutes: 60
+        )
+        let sessionID = UUID()
+        let session = WorkSession(
+            id: sessionID,
+            task: task,
+            startedAt: anchor,
+            durationSeconds: 25 * 60,
+            scheduledBlockId: attended.id
+        )
+        context.insert(attended)
+        context.insert(existingFuture)
+        context.insert(session)
+        try context.save()
+        attended.isComplete = true
+        try context.save()
+
+        var finalSaveFinished = false
+        var publishCount = 0
+        var durableCoverageSeenDuringPublish = 0
+        let result = try PlanCoordinator.reconcileTaskAfterAttendance(
+            task,
+            context: context,
+            save: { context in
+                try context.save()
+                finalSaveFinished = true
+            },
+            publish: { _ in
+                publishCount += 1
+                XCTAssertTrue(finalSaveFinished)
+                let fresh = ModelContext(self.container)
+                durableCoverageSeenDuringPublish = ((try? fresh.fetch(
+                    FetchDescriptor<ScheduledBlock>()
+                )) ?? [])
+                    .filter {
+                        $0.task?.id == task.id
+                            && !$0.isComplete
+                            && $0.endTime > Date()
+                    }
+                    .reduce(0) { $0 + $1.durationMinutes }
+            }
+        )
+
+        guard case .success = result else {
+            return XCTFail("expected full replacement coverage, got \(result)")
+        }
+        XCTAssertEqual(publishCount, 1)
+        XCTAssertEqual(durableCoverageSeenDuringPublish, task.remainingMinutes)
+        let verificationContext = ModelContext(container)
+        let durableSessions = try verificationContext.fetch(FetchDescriptor<WorkSession>())
+        XCTAssertEqual(durableSessions.map(\.id), [sessionID])
+    }
+
+    @MainActor
+    func testAttendanceReconciliationFailurePreservesLoggedSessionAndPlanForSameIdentityRetry() throws {
+        enum ExpectedFailure: Error { case save }
+
+        _ = makeSettings()
+        let task = makeTask(effort: 120, deadlineHoursFromAnchor: 72)
+        let attended = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 60)
+        let existingFuture = ScheduledBlock(
+            task: task,
+            startTime: anchor.addingTimeInterval(2 * 3600),
+            durationMinutes: 60
+        )
+        let sessionID = UUID()
+        let session = WorkSession(
+            id: sessionID,
+            task: task,
+            startedAt: anchor,
+            durationSeconds: 25 * 60,
+            scheduledBlockId: attended.id
+        )
+        let reminder = Reminder(
+            title: "Earlier accepted edit",
+            dueDate: anchor.addingTimeInterval(3600)
+        )
+        context.insert(attended)
+        context.insert(existingFuture)
+        context.insert(session)
+        context.insert(reminder)
+        try context.save()
+
+        // These mirror recordSession's already-durable attendance boundary;
+        // the unrelated edit arrives before reconciliation's preflight.
+        attended.isComplete = true
+        try context.save()
+        reminder.isComplete = true
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.reconcileTaskAfterAttendance(
+                task,
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertTrue(attended.isComplete)
+        XCTAssertEqual(Set(task.scheduledBlocks.map(\.id)), Set([attended.id, existingFuture.id]))
+
+        var verificationContext = ModelContext(container)
+        var durableSessions = try verificationContext.fetch(FetchDescriptor<WorkSession>())
+        var durableBlocks = try verificationContext.fetch(FetchDescriptor<ScheduledBlock>())
+            .filter { $0.task?.id == task.id }
+        let durableReminder = try XCTUnwrap(
+            verificationContext.fetch(FetchDescriptor<Reminder>()).first {
+                $0.id == reminder.id
+            }
+        )
+        XCTAssertEqual(durableSessions.map(\.id), [sessionID])
+        XCTAssertTrue(durableBlocks.contains { $0.id == attended.id && $0.isComplete })
+        XCTAssertTrue(durableBlocks.contains { $0.id == existingFuture.id && !$0.isComplete })
+        XCTAssertTrue(durableReminder.isComplete)
+
+        // A later End tap reuses the retained WorkSession identity and retries
+        // only the plan. Its longer elapsed time updates that row; the
+        // successful retry still leaves exactly one attendance record.
+        session.durationSeconds = 30 * 60
+        try context.save()
+        _ = try PlanCoordinator.reconcileTaskAfterAttendance(
+            task,
+            context: context,
+            publish: { _ in publishCount += 1 }
+        )
+        XCTAssertEqual(publishCount, 1)
+        verificationContext = ModelContext(container)
+        durableSessions = try verificationContext.fetch(FetchDescriptor<WorkSession>())
+        durableBlocks = try verificationContext.fetch(FetchDescriptor<ScheduledBlock>())
+            .filter { $0.task?.id == task.id }
+        XCTAssertEqual(durableSessions.map(\.id), [sessionID])
+        XCTAssertEqual(durableSessions.first?.durationSeconds, 30 * 60)
+        XCTAssertEqual(
+            durableBlocks
+                .filter { !$0.isComplete && $0.endTime > Date() }
+                .reduce(0) { $0 + $1.durationMinutes },
+            task.remainingMinutes
+        )
+    }
+
+    @MainActor
     func testUncheckingAttendedBlockReconciliationAvoidsDuplicateCoverage() throws {
         _ = makeSettings()
         let task = makeTask(effort: 120, deadlineHoursFromAnchor: 72)
@@ -2735,7 +3632,7 @@ final class FilumaTests: XCTestCase {
         try context.save()
 
         attended.isComplete = true
-        PlanCoordinator.reconcileTaskAfterProgress(
+        try PlanCoordinator.reconcileTaskAfterProgress(
             task,
             context: context,
             interactive: false
@@ -2743,7 +3640,7 @@ final class FilumaTests: XCTestCase {
         try context.save()
 
         attended.isComplete = false
-        PlanCoordinator.reconcileTaskAfterProgress(
+        try PlanCoordinator.reconcileTaskAfterProgress(
             task,
             context: context,
             interactive: false
@@ -2766,9 +3663,238 @@ final class FilumaTests: XCTestCase {
     }
 
     @MainActor
+    func testExplicitRescheduleReturnsTotalDurableCoverageAfterSave() throws {
+        let settings = makeSettings()
+        settings.startBufferMinutes = 0
+        settings.deadlineBufferMinutes = 0
+        let task = makeTask(effort: 120, deadlineHoursFromAnchor: 72)
+        let locked = ScheduledBlock(
+            task: task,
+            startTime: anchor.addingTimeInterval(60 * 60),
+            durationMinutes: 60
+        )
+        locked.isLocked = true
+        let movable = ScheduledBlock(
+            task: task,
+            startTime: anchor.addingTimeInterval(3 * 3600),
+            durationMinutes: 60
+        )
+        context.insert(locked)
+        context.insert(movable)
+        try context.save()
+        let customStart = anchor.addingTimeInterval(24 * 3600)
+        var finalSaveFinished = false
+        var publishCount = 0
+        var durableCoverageDuringPublish = 0
+
+        let result = try PlanCoordinator.rescheduleTask(
+            task,
+            context: context,
+            from: customStart,
+            now: anchor,
+            interactive: false,
+            save: { context in
+                try context.save()
+                finalSaveFinished = true
+            },
+            publish: { _, _ in
+                publishCount += 1
+                XCTAssertTrue(finalSaveFinished)
+                let fresh = ModelContext(self.container)
+                durableCoverageDuringPublish = ((try? fresh.fetch(
+                    FetchDescriptor<ScheduledBlock>()
+                )) ?? [])
+                    .filter { $0.task?.id == task.id && !$0.isComplete }
+                    .reduce(0) { $0 + $1.durationMinutes }
+            }
+        )
+
+        guard case .success(let durableCoverage) = result else {
+            return XCTFail("expected complete durable coverage, got \(result)")
+        }
+        XCTAssertEqual(publishCount, 1)
+        XCTAssertEqual(durableCoverageDuringPublish, 120)
+        XCTAssertEqual(durableCoverage.reduce(0) { $0 + $1.durationMinutes }, 120)
+        XCTAssertTrue(durableCoverage.contains { $0.id == locked.id })
+        XCTAssertTrue(durableCoverage.filter { !$0.isLocked }.allSatisfy {
+            $0.startTime >= customStart
+        })
+    }
+
+    @MainActor
+    func testExplicitRescheduleFailureRestoresHeldAndDurableGraphsWithoutPublish() throws {
+        enum ExpectedFailure: Error { case save }
+
+        _ = makeSettings()
+        let task = makeTask(effort: 90, deadlineHoursFromAnchor: 48)
+        let original = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 90)
+        let reminder = Reminder(
+            title: "Earlier accepted edit",
+            dueDate: anchor.addingTimeInterval(3600)
+        )
+        context.insert(original)
+        context.insert(reminder)
+        try context.save()
+        reminder.isComplete = true
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.rescheduleTask(
+                task,
+                context: context,
+                now: anchor,
+                interactive: false,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _, _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertEqual(task.scheduledBlocks.map(\.id), [original.id])
+        XCTAssertEqual(original.task?.id, task.id)
+        let fresh = ModelContext(container)
+        let durableBlocks = try fresh.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == task.id
+        }
+        let durableReminder = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<Reminder>()).first { $0.id == reminder.id }
+        )
+        XCTAssertEqual(durableBlocks.map(\.id), [original.id])
+        XCTAssertTrue(durableReminder.isComplete)
+    }
+
+    @MainActor
+    func testBlockCompletionFailureRestoresToggleAndPlanWithoutPublish() throws {
+        enum ExpectedFailure: Error { case save }
+
+        _ = makeSettings()
+        let task = makeTask(effort: 120, deadlineHoursFromAnchor: 48)
+        let toggled = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 60)
+        let future = ScheduledBlock(
+            task: task,
+            startTime: anchor.addingTimeInterval(2 * 3600),
+            durationMinutes: 60
+        )
+        context.insert(toggled)
+        context.insert(future)
+        try context.save()
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.setBlockCompletion(
+                toggled,
+                isComplete: true,
+                context: context,
+                now: anchor,
+                interactive: false,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _, _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertFalse(toggled.isComplete)
+        XCTAssertEqual(Set(task.scheduledBlocks.map(\.id)), Set([toggled.id, future.id]))
+        XCTAssertEqual(toggled.task?.id, task.id)
+        let fresh = ModelContext(container)
+        let durableBlocks = try fresh.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == task.id
+        }
+        XCTAssertEqual(Set(durableBlocks.map(\.id)), Set([toggled.id, future.id]))
+        XCTAssertTrue(durableBlocks.allSatisfy { !$0.isComplete })
+    }
+
+    @MainActor
+    func testTaskDeleteFailureRestoresChildrenAndRetryPublishesOnlyAfterCommit() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        let block = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 60)
+        let session = WorkSession(
+            task: task,
+            startedAt: anchor,
+            durationSeconds: 15 * 60,
+            scheduledBlockId: block.id
+        )
+        let reminder = Reminder(
+            title: "Earlier accepted edit",
+            dueDate: anchor.addingTimeInterval(3600)
+        )
+        context.insert(block)
+        context.insert(session)
+        context.insert(reminder)
+        try context.save()
+        reminder.isComplete = true
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.deleteTask(
+                task,
+                context: context,
+                interactive: false,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _, _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertEqual(task.scheduledBlocks.map(\.id), [block.id])
+        XCTAssertEqual(task.workSessions.map(\.id), [session.id])
+        XCTAssertEqual(block.task?.id, task.id)
+        XCTAssertEqual(session.task?.id, task.id)
+        var fresh = ModelContext(container)
+        XCTAssertNotNil(try fresh.fetch(FetchDescriptor<FilumaTask>()).first {
+            $0.id == task.id
+        })
+        XCTAssertEqual(try fresh.fetch(FetchDescriptor<ScheduledBlock>()).map(\.id), [block.id])
+        XCTAssertEqual(try fresh.fetch(FetchDescriptor<WorkSession>()).map(\.id), [session.id])
+        XCTAssertTrue(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<Reminder>()).first { $0.id == reminder.id }
+        ).isComplete)
+
+        var finalSaveFinished = false
+        try PlanCoordinator.deleteTask(
+            task,
+            context: context,
+            interactive: false,
+            save: { context in
+                try context.save()
+                finalSaveFinished = true
+            },
+            publish: { _, _ in
+                publishCount += 1
+                XCTAssertTrue(finalSaveFinished)
+                let verification = ModelContext(self.container)
+                XCTAssertFalse(((try? verification.fetch(
+                    FetchDescriptor<FilumaTask>()
+                )) ?? []).contains { $0.id == task.id })
+                XCTAssertFalse(((try? verification.fetch(
+                    FetchDescriptor<ScheduledBlock>()
+                )) ?? []).contains { $0.id == block.id })
+                XCTAssertFalse(((try? verification.fetch(
+                    FetchDescriptor<WorkSession>()
+                )) ?? []).contains { $0.id == session.id })
+            }
+        )
+
+        XCTAssertEqual(publishCount, 1)
+        fresh = ModelContext(container)
+        XCTAssertFalse(try fresh.fetch(FetchDescriptor<FilumaTask>()).contains {
+            $0.id == task.id
+        })
+        XCTAssertFalse(try fresh.fetch(FetchDescriptor<ScheduledBlock>()).contains {
+            $0.id == block.id
+        })
+        XCTAssertFalse(try fresh.fetch(FetchDescriptor<WorkSession>()).contains {
+            $0.id == session.id
+        })
+    }
+
+    @MainActor
     func testPlanningPreferenceRebuildCountsLockedCoverageTowardRemainder() throws {
         let settings = makeSettings()
         settings.minBlockMinutes = 15
+        settings.planningRebuildPending = true
         let task = makeTask(effort: 180, deadlineHoursFromAnchor: 72)
         task.manualProgressPercent = 50
         let locked = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 60)
@@ -2782,7 +3908,7 @@ final class FilumaTests: XCTestCase {
         context.insert(movable)
         try context.save()
 
-        PlanCoordinator.rebuildAfterPlanningPreferencesChange(
+        try PlanCoordinator.rebuildAfterPlanningPreferencesChange(
             context: context,
             interactive: false
         )
@@ -2796,6 +3922,794 @@ final class FilumaTests: XCTestCase {
         XCTAssertFalse(future.contains { $0.id == movable.id })
         XCTAssertEqual(future.reduce(0) { $0 + $1.durationMinutes }, 90)
         XCTAssertEqual(future.filter { !$0.isLocked }.reduce(0) { $0 + $1.durationMinutes }, 30)
+        XCTAssertFalse(settings.planningRebuildPending)
+    }
+
+    @MainActor
+    func testPlanningPreferenceRebuildFailureKeepsDurablePlanAndDoesNotPublish() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let settings = makeSettings()
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        let original = ScheduledBlock(
+            task: task,
+            startTime: anchor,
+            durationMinutes: 60
+        )
+        context.insert(original)
+        try context.save()
+
+        // Mirrors the Settings UI: the chosen preference is accepted before
+        // the derived plan rebuild begins.
+        settings.minBlockMinutes = 15
+        settings.planningRebuildPending = true
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.rebuildAfterPlanningPreferencesChange(
+                context: context,
+                interactive: false,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _, _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertEqual(settings.minBlockMinutes, 15)
+        XCTAssertTrue(settings.planningRebuildPending)
+        XCTAssertEqual(task.scheduledBlocks.map(\.id), [original.id])
+        let fresh = ModelContext(container)
+        XCTAssertEqual(
+            try fresh.fetch(FetchDescriptor<UserSettings>()).first?.minBlockMinutes,
+            15
+        )
+        XCTAssertTrue(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        ).planningRebuildPending)
+        let durable = try fresh.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == task.id
+        }
+        XCTAssertEqual(durable.map(\.id), [original.id])
+    }
+
+    @MainActor
+    func testAppleImportFetchFailureLeavesExistingMirrorUntouched() throws {
+        enum ExpectedFailure: Error { case fetch }
+
+        let settings = makeSettings()
+        settings.importFromAppleCalendar = true
+        let existing = BusyEvent(
+            source: .appleCalendar,
+            sourceId: "apple-existing",
+            title: "Existing class",
+            startTime: anchor,
+            endTime: anchor.addingTimeInterval(3600)
+        )
+        context.insert(existing)
+        try context.save()
+        CalendarImportService.loadBusyEvents = { _ in
+            throw ExpectedFailure.fetch
+        }
+        defer {
+            CalendarImportService.loadBusyEvents = {
+                try $0.fetch(FetchDescriptor<BusyEvent>())
+            }
+        }
+
+        XCTAssertThrowsError(
+            try CalendarImportService.syncNow(
+                context: context,
+                settings: settings
+            )
+        )
+
+        XCTAssertEqual(settings.importFromAppleCalendar, true)
+        let durable = try ModelContext(container).fetch(FetchDescriptor<BusyEvent>())
+        XCTAssertEqual(durable.map(\.id), [existing.id])
+    }
+
+    @MainActor
+    func testAppleImportEnableFailureKeepsToggleAndMirrorUndurableUntilRetry() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let settings = makeSettings()
+        try context.save()
+        let transient = BusyEvent(
+            source: .appleCalendar,
+            sourceId: "apple-enable-transient",
+            title: "New class",
+            startTime: anchor,
+            endTime: anchor.addingTimeInterval(3600)
+        )
+
+        XCTAssertThrowsError(
+            try CalendarImportService.enableImport(
+                settings: settings,
+                context: context,
+                sync: { context, _ in context.insert(transient) },
+                save: { _ in throw ExpectedFailure.save }
+            )
+        )
+
+        XCTAssertFalse(settings.importFromAppleCalendar)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<BusyEvent>()).isEmpty)
+        var fresh = ModelContext(container)
+        XCTAssertFalse(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        ).importFromAppleCalendar)
+        XCTAssertTrue(try fresh.fetch(FetchDescriptor<BusyEvent>()).isEmpty)
+
+        var durableEventID: UUID?
+        try CalendarImportService.enableImport(
+            settings: settings,
+            context: context,
+            sync: { context, _ in
+                let event = BusyEvent(
+                    source: .appleCalendar,
+                    sourceId: "apple-enable-durable",
+                    title: "New class",
+                    startTime: self.anchor,
+                    endTime: self.anchor.addingTimeInterval(3600)
+                )
+                durableEventID = event.id
+                context.insert(event)
+            }
+        )
+
+        XCTAssertTrue(settings.importFromAppleCalendar)
+        fresh = ModelContext(container)
+        XCTAssertTrue(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        ).importFromAppleCalendar)
+        XCTAssertEqual(
+            try fresh.fetch(FetchDescriptor<BusyEvent>()).map(\.id),
+            [try XCTUnwrap(durableEventID)]
+        )
+    }
+
+    @MainActor
+    func testAppleImportDisableFailureKeepsPreferenceAndMirrorForRetry() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let settings = makeSettings()
+        settings.importFromAppleCalendar = true
+        let existing = BusyEvent(
+            source: .appleCalendar,
+            sourceId: "apple-disable-existing",
+            title: "Existing class",
+            startTime: anchor,
+            endTime: anchor.addingTimeInterval(3600)
+        )
+        context.insert(existing)
+        try context.save()
+
+        XCTAssertThrowsError(
+            try CalendarImportService.disableImport(
+                settings: settings,
+                context: context,
+                save: { _ in throw ExpectedFailure.save }
+            )
+        )
+
+        XCTAssertTrue(settings.importFromAppleCalendar)
+        XCTAssertEqual(
+            try context.fetch(FetchDescriptor<BusyEvent>()).map(\.id),
+            [existing.id]
+        )
+        var fresh = ModelContext(container)
+        XCTAssertTrue(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        ).importFromAppleCalendar)
+        XCTAssertEqual(
+            try fresh.fetch(FetchDescriptor<BusyEvent>()).map(\.id),
+            [existing.id]
+        )
+
+        try CalendarImportService.disableImport(
+            settings: settings,
+            context: context
+        )
+        fresh = ModelContext(container)
+        XCTAssertFalse(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        ).importFromAppleCalendar)
+        XCTAssertTrue(try fresh.fetch(FetchDescriptor<BusyEvent>()).isEmpty)
+    }
+
+    @MainActor
+    func testAppleCalendarExclusionFailureKeepsChoiceAndMirrorTogetherForRetry() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let settings = makeSettings()
+        settings.importFromAppleCalendar = true
+        let existing = BusyEvent(
+            source: .appleCalendar,
+            sourceId: "apple-family-existing",
+            title: "Family calendar",
+            startTime: anchor,
+            endTime: anchor.addingTimeInterval(3600),
+            calendarName: "Family"
+        )
+        context.insert(existing)
+        try context.save()
+        let transient = BusyEvent(
+            source: .appleCalendar,
+            sourceId: "apple-transient",
+            title: "Transient",
+            startTime: anchor.addingTimeInterval(7200),
+            endTime: anchor.addingTimeInterval(10_800)
+        )
+
+        XCTAssertThrowsError(
+            try CalendarImportService.updateExcludedCalendars(
+                ["family-calendar"],
+                settings: settings,
+                context: context,
+                sync: { context, _ in
+                    existing.title = "Changed before rejected save"
+                    context.delete(existing)
+                    context.insert(transient)
+                },
+                save: { _ in throw ExpectedFailure.save }
+            )
+        )
+
+        XCTAssertEqual(settings.excludedCalendarIds, [])
+        XCTAssertEqual(existing.title, "Family calendar")
+        XCTAssertEqual(
+            try context.fetch(FetchDescriptor<BusyEvent>()).map(\.id),
+            [existing.id]
+        )
+        var fresh = ModelContext(container)
+        XCTAssertEqual(
+            try XCTUnwrap(fresh.fetch(FetchDescriptor<UserSettings>()).first)
+                .excludedCalendarIds,
+            []
+        )
+        XCTAssertEqual(
+            try fresh.fetch(FetchDescriptor<BusyEvent>()).map(\.id),
+            [existing.id]
+        )
+
+        var replacementID: UUID?
+        try CalendarImportService.updateExcludedCalendars(
+            ["work-calendar", "family-calendar", "family-calendar"],
+            settings: settings,
+            context: context,
+            sync: { context, _ in
+                context.delete(existing)
+                let replacement = BusyEvent(
+                    source: .appleCalendar,
+                    sourceId: "apple-work-kept",
+                    title: "Work calendar",
+                    startTime: self.anchor.addingTimeInterval(7200),
+                    endTime: self.anchor.addingTimeInterval(10_800),
+                    calendarName: "Work"
+                )
+                replacementID = replacement.id
+                context.insert(replacement)
+            }
+        )
+
+        XCTAssertEqual(
+            settings.excludedCalendarIds,
+            ["family-calendar", "work-calendar"]
+        )
+        fresh = ModelContext(container)
+        XCTAssertEqual(
+            try XCTUnwrap(fresh.fetch(FetchDescriptor<UserSettings>()).first)
+                .excludedCalendarIds,
+            ["family-calendar", "work-calendar"]
+        )
+        XCTAssertEqual(
+            try fresh.fetch(FetchDescriptor<BusyEvent>()).map(\.id),
+            [try XCTUnwrap(replacementID)]
+        )
+    }
+
+    @MainActor
+    func testTaskEditAtomicallyPersistsDetailsWithoutReplanning() throws {
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        task.firstStep = "Open the notes"
+        try context.save()
+        var publishCount = 0
+
+        let result = try PlanCoordinator.saveTaskEdits(
+            task,
+            update: TaskEditUpdate(
+                title: "  Revised task  ",
+                firstStep: "  Draft the opening  ",
+                taskContext: .work,
+                deadline: task.deadline,
+                effortMinutes: task.effortMinutes
+            ),
+            context: context,
+            publish: { _ in publishCount += 1 }
+        )
+
+        XCTAssertNil(result)
+        XCTAssertEqual(publishCount, 1)
+        XCTAssertEqual(task.title, "Revised task")
+        XCTAssertEqual(task.firstStep, "Draft the opening")
+        XCTAssertEqual(task.context, .work)
+        XCTAssertTrue(task.userModified)
+
+        let verificationContext = ModelContext(container)
+        let durableTask = try XCTUnwrap(
+            verificationContext.fetch(FetchDescriptor<FilumaTask>()).first {
+                $0.id == task.id
+            }
+        )
+        XCTAssertEqual(durableTask.title, "Revised task")
+        XCTAssertEqual(durableTask.firstStep, "Draft the opening")
+        XCTAssertEqual(durableTask.context, .work)
+        XCTAssertTrue(durableTask.userModified)
+    }
+
+    @MainActor
+    func testTaskEditAtomicallyPersistsDetailsAndReplacementPlan() throws {
+        _ = makeSettings()
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        let original = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 60)
+        context.insert(original)
+        try context.save()
+        let revisedDeadline = task.deadline.addingTimeInterval(24 * 3600)
+
+        let result = try PlanCoordinator.saveTaskEdits(
+            task,
+            update: TaskEditUpdate(
+                title: "Expanded task",
+                firstStep: nil,
+                taskContext: .personal,
+                deadline: revisedDeadline,
+                effortMinutes: 120
+            ),
+            context: context,
+            publish: { _ in }
+        )
+
+        guard let result, case .success(let replacementBlocks) = result else {
+            return XCTFail("expected full replacement coverage, got \(String(describing: result))")
+        }
+        XCTAssertEqual(task.title, "Expanded task")
+        XCTAssertEqual(task.context, .personal)
+        XCTAssertEqual(task.deadline, revisedDeadline)
+        XCTAssertEqual(task.effortMinutes, 120)
+        XCTAssertEqual(replacementBlocks.reduce(0) { $0 + $1.durationMinutes }, 120)
+
+        let verificationContext = ModelContext(container)
+        let durableTask = try XCTUnwrap(
+            verificationContext.fetch(FetchDescriptor<FilumaTask>()).first {
+                $0.id == task.id
+            }
+        )
+        let durableBlocks = try verificationContext
+            .fetch(FetchDescriptor<ScheduledBlock>())
+            .filter { $0.task?.id == task.id && !$0.isComplete }
+        XCTAssertEqual(durableTask.title, "Expanded task")
+        XCTAssertEqual(durableTask.context, .personal)
+        XCTAssertEqual(durableTask.deadline, revisedDeadline)
+        XCTAssertEqual(durableTask.effortMinutes, 120)
+        XCTAssertEqual(durableBlocks.reduce(0) { $0 + $1.durationMinutes }, 120)
+        XCTAssertFalse(durableBlocks.contains { $0.id == original.id })
+    }
+
+    @MainActor
+    func testTaskEditResultIncludesRetainedLockedCoverage() throws {
+        let settings = makeSettings()
+        settings.startBufferMinutes = 0
+        settings.deadlineBufferMinutes = 0
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        let locked = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 60)
+        locked.isLocked = true
+        let busy = BusyEvent(
+            source: .appleCalendar,
+            sourceId: "task-edit-locked-coverage",
+            title: "No other room",
+            startTime: Date().addingTimeInterval(-3600),
+            endTime: task.deadline.addingTimeInterval(24 * 3600)
+        )
+        context.insert(locked)
+        context.insert(busy)
+        try context.save()
+
+        let result = try PlanCoordinator.saveTaskEdits(
+            task,
+            update: TaskEditUpdate(
+                title: task.title,
+                firstStep: nil,
+                taskContext: task.context,
+                deadline: task.deadline,
+                effortMinutes: 120
+            ),
+            context: context,
+            publish: { _ in }
+        )
+
+        guard let result,
+              case .partialFit(let scheduled, let unscheduledMinutes) = result else {
+            return XCTFail("expected retained coverage plus a shortfall, got \(String(describing: result))")
+        }
+        XCTAssertEqual(scheduled.map(\.id), [locked.id])
+        XCTAssertEqual(scheduled.reduce(0) { $0 + $1.durationMinutes }, 60)
+        XCTAssertEqual(unscheduledMinutes, 60)
+        XCTAssertTrue(locked.isLocked)
+    }
+
+    @MainActor
+    func testTaskEditCreditsOnlyUsableOverlapOfInProgressRetainedLock() throws {
+        let settings = makeSettings()
+        settings.startBufferMinutes = 0
+        settings.deadlineBufferMinutes = 0
+        let task = makeTask(effort: 30, deadlineHoursFromAnchor: 1)
+        let locked = ScheduledBlock(
+            task: task,
+            startTime: anchor.addingTimeInterval(-50 * 60),
+            durationMinutes: 60
+        )
+        locked.isLocked = true
+        let busy = BusyEvent(
+            source: .appleCalendar,
+            sourceId: "task-edit-clipped-lock",
+            title: "No replacement room",
+            startTime: anchor,
+            endTime: task.deadline
+        )
+        context.insert(locked)
+        context.insert(busy)
+        try context.save()
+
+        let result = try PlanCoordinator.saveTaskEdits(
+            task,
+            update: TaskEditUpdate(
+                title: task.title,
+                firstStep: nil,
+                taskContext: task.context,
+                deadline: task.deadline,
+                effortMinutes: 60
+            ),
+            context: context,
+            now: anchor,
+            publish: { _ in }
+        )
+
+        guard let result,
+              case .partialFit(let scheduled, let unscheduledMinutes) = result else {
+            return XCTFail("expected clipped retained coverage, got \(String(describing: result))")
+        }
+        XCTAssertEqual(scheduled.map(\.id), [locked.id])
+        XCTAssertEqual(scheduled.first?.durationMinutes, 60)
+        XCTAssertEqual(unscheduledMinutes, 50)
+        XCTAssertEqual(
+            task.remainingMinutes - unscheduledMinutes,
+            10,
+            "Feedback must credit only the retained row's usable overlap after now."
+        )
+    }
+
+    @MainActor
+    func testTaskEditFailureDoesNotLeakNewDefaultSettings() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        try context.save()
+        XCTAssertTrue(try context.fetch(FetchDescriptor<UserSettings>()).isEmpty)
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.saveTaskEdits(
+                task,
+                update: TaskEditUpdate(
+                    title: task.title,
+                    firstStep: nil,
+                    taskContext: task.context,
+                    deadline: task.deadline.addingTimeInterval(24 * 3600),
+                    effortMinutes: task.effortMinutes
+                ),
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _ in XCTFail("failed edits must not publish") }
+            )
+        )
+
+        XCTAssertTrue(try context.fetch(FetchDescriptor<UserSettings>()).isEmpty)
+        let verificationContext = ModelContext(container)
+        XCTAssertTrue(try verificationContext.fetch(FetchDescriptor<UserSettings>()).isEmpty)
+    }
+
+    @MainActor
+    func testTaskEditSaveFailureRestoresHeldAndDurableTaskAndPlan() throws {
+        enum ExpectedFailure: Error { case save }
+
+        _ = makeSettings()
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        task.firstStep = "Open the notes"
+        let originalDeadline = task.deadline
+        let original = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 60)
+        context.insert(original)
+        try context.save()
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.saveTaskEdits(
+                task,
+                update: TaskEditUpdate(
+                    title: "Rejected edit",
+                    firstStep: "Rejected step",
+                    taskContext: .work,
+                    deadline: originalDeadline.addingTimeInterval(24 * 3600),
+                    effortMinutes: 120
+                ),
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertEqual(task.title, "Test task")
+        XCTAssertEqual(task.firstStep, "Open the notes")
+        XCTAssertEqual(task.context, .school)
+        XCTAssertEqual(task.deadline, originalDeadline)
+        XCTAssertEqual(task.effortMinutes, 60)
+        XCTAssertFalse(task.userModified)
+        XCTAssertEqual(task.scheduledBlocks.map(\.id), [original.id])
+
+        let verificationContext = ModelContext(container)
+        let durableTask = try XCTUnwrap(
+            verificationContext.fetch(FetchDescriptor<FilumaTask>()).first {
+                $0.id == task.id
+            }
+        )
+        let durableBlocks = try verificationContext
+            .fetch(FetchDescriptor<ScheduledBlock>())
+            .filter { $0.task?.id == task.id }
+        XCTAssertEqual(durableTask.title, "Test task")
+        XCTAssertEqual(durableTask.firstStep, "Open the notes")
+        XCTAssertEqual(durableTask.context, .school)
+        XCTAssertEqual(durableTask.deadline, originalDeadline)
+        XCTAssertEqual(durableTask.effortMinutes, 60)
+        XCTAssertFalse(durableTask.userModified)
+        XCTAssertEqual(durableBlocks.map(\.id), [original.id])
+    }
+
+    @MainActor
+    func testTaskEditFailurePreservesEarlierPendingChanges() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        let reminder = Reminder(
+            title: "Take meds",
+            dueDate: anchor.addingTimeInterval(3600)
+        )
+        context.insert(reminder)
+        try context.save()
+
+        reminder.isComplete = true
+        XCTAssertThrowsError(
+            try PlanCoordinator.saveTaskEdits(
+                task,
+                update: TaskEditUpdate(
+                    title: "Rejected edit",
+                    firstStep: nil,
+                    taskContext: .school,
+                    deadline: task.deadline,
+                    effortMinutes: task.effortMinutes
+                ),
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _ in XCTFail("failed edits must not publish") }
+            )
+        )
+
+        let verificationContext = ModelContext(container)
+        let durableTask = try XCTUnwrap(
+            verificationContext.fetch(FetchDescriptor<FilumaTask>()).first {
+                $0.id == task.id
+            }
+        )
+        let durableReminder = try XCTUnwrap(
+            verificationContext.fetch(FetchDescriptor<Reminder>()).first {
+                $0.id == reminder.id
+            }
+        )
+        XCTAssertEqual(durableTask.title, "Test task")
+        XCTAssertTrue(durableReminder.isComplete)
+    }
+
+    @MainActor
+    func testTaskEditRejectsDeadlineThatBecamePastBeforeSave() throws {
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        try context.save()
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.saveTaskEdits(
+                task,
+                update: TaskEditUpdate(
+                    title: "Should not save",
+                    firstStep: nil,
+                    taskContext: .work,
+                    deadline: anchor,
+                    effortMinutes: 120
+                ),
+                context: context,
+                now: anchor.addingTimeInterval(1),
+                publish: { _ in publishCount += 1 }
+            )
+        ) { error in
+            XCTAssertEqual(error as? TaskEditCoordinatorError, .deadlineNotFuture)
+        }
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertEqual(task.title, "Test task")
+        XCTAssertEqual(task.context, .school)
+        XCTAssertEqual(task.effortMinutes, 60)
+        let durable = ModelContext(container)
+        let durableTask = try XCTUnwrap(
+            durable.fetch(FetchDescriptor<FilumaTask>()).first { $0.id == task.id }
+        )
+        XCTAssertEqual(durableTask.title, "Test task")
+        XCTAssertEqual(durableTask.effortMinutes, 60)
+    }
+
+    @MainActor
+    func testPartialProgressSuccessReplansCoverageForSmallerRemainder() throws {
+        _ = makeSettings()
+        let task = makeTask(effort: 120, deadlineHoursFromAnchor: 48)
+        let original = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 120)
+        context.insert(original)
+        try context.save()
+
+        let result = try PlanCoordinator.savePartialProgress(
+            task,
+            reportedProgress: 50,
+            context: context,
+            interactive: false
+        )
+
+        guard case .success(let replacementBlocks) = result else {
+            return XCTFail("expected full replacement coverage, got \(result)")
+        }
+        let future = try context.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == task.id && !$0.isComplete
+        }
+        XCTAssertEqual(task.manualProgressPercent, 50)
+        XCTAssertEqual(task.remainingMinutes, 60)
+        XCTAssertEqual(replacementBlocks.reduce(0) { $0 + $1.durationMinutes }, 60)
+        XCTAssertEqual(future.reduce(0) { $0 + $1.durationMinutes }, 60)
+        XCTAssertFalse(future.contains { $0.id == original.id })
+    }
+
+    @MainActor
+    func testPartialProgressClampsBelowCompletion() throws {
+        _ = makeSettings()
+        let task = makeTask(effort: 100, deadlineHoursFromAnchor: 48)
+        let original = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 100)
+        context.insert(original)
+        try context.save()
+
+        _ = try PlanCoordinator.savePartialProgress(
+            task,
+            reportedProgress: 140,
+            context: context,
+            interactive: false
+        )
+
+        let future = try context.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == task.id && !$0.isComplete
+        }
+        XCTAssertEqual(task.manualProgressPercent, 99)
+        XCTAssertFalse(task.isComplete)
+        XCTAssertEqual(task.remainingMinutes, 1)
+        XCTAssertEqual(future.reduce(0) { $0 + $1.durationMinutes }, 1)
+    }
+
+    @MainActor
+    func testPartialProgressNeverMovesBackward() throws {
+        _ = makeSettings()
+        let task = makeTask(effort: 100, deadlineHoursFromAnchor: 48)
+        task.manualProgressPercent = 70
+        let original = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 30)
+        context.insert(original)
+        try context.save()
+
+        _ = try PlanCoordinator.savePartialProgress(
+            task,
+            reportedProgress: 35,
+            context: context,
+            interactive: false
+        )
+
+        let future = try context.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == task.id && !$0.isComplete
+        }
+        XCTAssertEqual(task.manualProgressPercent, 70)
+        XCTAssertEqual(task.remainingMinutes, 30)
+        XCTAssertEqual(future.reduce(0) { $0 + $1.durationMinutes }, 30)
+    }
+
+    @MainActor
+    func testPartialProgressSaveFailureRestoresHeldAndDurablePlan() throws {
+        enum ExpectedFailure: Error { case save }
+
+        _ = makeSettings()
+        let task = makeTask(effort: 100, deadlineHoursFromAnchor: 48)
+        task.manualProgressPercent = 20
+        let original = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 80)
+        context.insert(original)
+        try context.save()
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.savePartialProgress(
+                task,
+                reportedProgress: 60,
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                interactive: false
+            )
+        )
+
+        XCTAssertEqual(task.manualProgressPercent, 20)
+        XCTAssertFalse(task.isComplete)
+        XCTAssertEqual(task.scheduledBlocks.map(\.id), [original.id])
+
+        let verificationContext = ModelContext(container)
+        let durableTask = try XCTUnwrap(
+            verificationContext.fetch(FetchDescriptor<FilumaTask>()).first {
+                $0.id == task.id
+            }
+        )
+        let durableBlocks = try verificationContext
+            .fetch(FetchDescriptor<ScheduledBlock>())
+            .filter { $0.task?.id == task.id }
+        XCTAssertEqual(durableTask.manualProgressPercent, 20)
+        XCTAssertFalse(durableTask.isComplete)
+        XCTAssertEqual(durableBlocks.map(\.id), [original.id])
+    }
+
+    @MainActor
+    func testPartialProgressFailurePreservesEarlierPendingChanges() throws {
+        enum ExpectedFailure: Error { case save }
+
+        _ = makeSettings()
+        let task = makeTask(effort: 100, deadlineHoursFromAnchor: 48)
+        let original = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 100)
+        let reminder = Reminder(
+            title: "Take meds",
+            dueDate: anchor.addingTimeInterval(3600)
+        )
+        context.insert(original)
+        context.insert(reminder)
+        try context.save()
+
+        reminder.isComplete = true
+        XCTAssertThrowsError(
+            try PlanCoordinator.savePartialProgress(
+                task,
+                reportedProgress: 50,
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                interactive: false
+            )
+        )
+
+        let verificationContext = ModelContext(container)
+        let durableTask = try XCTUnwrap(
+            verificationContext.fetch(FetchDescriptor<FilumaTask>()).first {
+                $0.id == task.id
+            }
+        )
+        let durableReminder = try XCTUnwrap(
+            verificationContext.fetch(FetchDescriptor<Reminder>()).first {
+                $0.id == reminder.id
+            }
+        )
+        let durableBlocks = try verificationContext
+            .fetch(FetchDescriptor<ScheduledBlock>())
+            .filter { $0.task?.id == task.id }
+        XCTAssertTrue(durableReminder.isComplete)
+        XCTAssertEqual(durableTask.manualProgressPercent, 0)
+        XCTAssertEqual(durableBlocks.map(\.id), [original.id])
     }
 
     @MainActor
@@ -2807,13 +4721,300 @@ final class FilumaTests: XCTestCase {
         context.insert(locked)
         try context.save()
 
-        PlanCoordinator.completeTask(task, context: context, interactive: false)
+        try PlanCoordinator.completeTask(task, context: context, interactive: false)
 
         let surviving = try context.fetch(FetchDescriptor<ScheduledBlock>()).filter {
             $0.task?.id == task.id && !$0.isComplete
         }
         XCTAssertTrue(task.isComplete)
         XCTAssertTrue(surviving.isEmpty, "explicit completion must release locked reservations")
+    }
+
+    @MainActor
+    func testCompletionAtomicallyPersistsReportedProgressAndReceipt() throws {
+        _ = makeSettings()
+        let task = makeTask(effort: 90, deadlineHoursFromAnchor: 48)
+        task.manualProgressPercent = 35
+        let future = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 60)
+        let completionDate = anchor.addingTimeInterval(6 * 3600)
+        context.insert(future)
+        try context.save()
+
+        let receipt = try PlanCoordinator.completeTask(
+            task,
+            context: context,
+            reportedProgress: 100,
+            completedAt: completionDate,
+            interactive: false
+        )
+
+        let persisted = try XCTUnwrap(
+            context.fetch(FetchDescriptor<FilumaTask>()).first { $0.id == task.id }
+        )
+        let remainingBlocks = try context.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == task.id
+        }
+        XCTAssertTrue(persisted.isComplete)
+        XCTAssertEqual(persisted.manualProgressPercent, 100)
+        XCTAssertEqual(persisted.completedAt, completionDate)
+        XCTAssertTrue(remainingBlocks.isEmpty)
+        XCTAssertEqual(receipt.taskID, task.id)
+        XCTAssertEqual(receipt.completedAt, completionDate)
+        XCTAssertEqual(receipt.title, task.title)
+    }
+
+    @MainActor
+    func testCompletionPreservesAttendanceAndAvoidsDoubleCountingReceiptTime() throws {
+        _ = makeSettings()
+        let task = makeTask(effort: 120, deadlineHoursFromAnchor: 48)
+        let attended = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 30)
+        attended.isComplete = true
+        let future = ScheduledBlock(
+            task: task,
+            startTime: anchor.addingTimeInterval(2 * 3600),
+            durationMinutes: 60
+        )
+        let session = WorkSession(
+            task: task,
+            startedAt: anchor,
+            durationSeconds: 25 * 60,
+            scheduledBlockId: attended.id
+        )
+        context.insert(attended)
+        context.insert(future)
+        context.insert(session)
+        try context.save()
+
+        let receipt = try PlanCoordinator.completeTask(
+            task,
+            context: context,
+            completedAt: anchor.addingTimeInterval(3600),
+            interactive: false
+        )
+
+        let blocks = try context.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == task.id
+        }
+        let sessions = try context.fetch(FetchDescriptor<WorkSession>()).filter {
+            $0.task?.id == task.id
+        }
+        XCTAssertEqual(blocks.map(\.id), [attended.id])
+        XCTAssertEqual(sessions.map(\.id), [session.id])
+        XCTAssertEqual(receipt.timeSpentMinutes, 25)
+    }
+
+    @MainActor
+    func testCompletionIsIdempotentAndPreservesOriginalTimestamp() throws {
+        _ = makeSettings()
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        try context.save()
+        let originalDate = anchor.addingTimeInterval(2 * 3600)
+        let laterDate = originalDate.addingTimeInterval(5 * 3600)
+
+        let first = try PlanCoordinator.completeTask(
+            task,
+            context: context,
+            completedAt: originalDate,
+            interactive: false
+        )
+        let second = try PlanCoordinator.completeTask(
+            task,
+            context: context,
+            reportedProgress: 100,
+            completedAt: laterDate,
+            interactive: false
+        )
+
+        XCTAssertEqual(task.completedAt, originalDate)
+        XCTAssertEqual(first.completedAt, originalDate)
+        XCTAssertEqual(second.completedAt, originalDate)
+    }
+
+    @MainActor
+    func testCompletionSaveFailureRollsBackTaskAndReservations() throws {
+        enum ExpectedFailure: Error { case save }
+
+        _ = makeSettings()
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        let future = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 60)
+        context.insert(future)
+        try context.save()
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.completeTask(
+                task,
+                context: context,
+                reportedProgress: 100,
+                save: { _ in throw ExpectedFailure.save },
+                interactive: false
+            )
+        )
+
+        XCTAssertFalse(task.isComplete)
+        XCTAssertNil(task.completedAt)
+        XCTAssertEqual(task.manualProgressPercent, 0)
+        XCTAssertEqual(task.scheduledBlocks.map(\.id), [future.id])
+
+        let persisted = try XCTUnwrap(
+            context.fetch(FetchDescriptor<FilumaTask>()).first { $0.id == task.id }
+        )
+        let blocks = try context.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == task.id
+        }
+        XCTAssertFalse(persisted.isComplete)
+        XCTAssertNil(persisted.completedAt)
+        XCTAssertEqual(persisted.manualProgressPercent, 0)
+        XCTAssertEqual(blocks.map(\.id), [future.id])
+
+        let verificationContext = ModelContext(container)
+        let durableTask = try XCTUnwrap(
+            verificationContext.fetch(FetchDescriptor<FilumaTask>()).first {
+                $0.id == task.id
+            }
+        )
+        let durableBlocks = try verificationContext
+            .fetch(FetchDescriptor<ScheduledBlock>())
+            .filter { $0.task?.id == task.id }
+        XCTAssertFalse(durableTask.isComplete)
+        XCTAssertEqual(durableTask.manualProgressPercent, 0)
+        XCTAssertEqual(durableBlocks.map(\.id), [future.id])
+    }
+
+    @MainActor
+    func testCompletionFailurePreservesEarlierPendingChanges() throws {
+        enum ExpectedFailure: Error { case save }
+
+        _ = makeSettings()
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        let reminder = Reminder(
+            title: "Take meds",
+            dueDate: anchor.addingTimeInterval(3600)
+        )
+        context.insert(reminder)
+        try context.save()
+
+        // Completion's rollback must not reach behind its own transaction and
+        // reactivate an unrelated reminder the user already checked.
+        reminder.isComplete = true
+        XCTAssertThrowsError(
+            try PlanCoordinator.completeTask(
+                task,
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                interactive: false
+            )
+        )
+
+        let verificationContext = ModelContext(container)
+        let durableTask = try XCTUnwrap(
+            verificationContext.fetch(FetchDescriptor<FilumaTask>()).first {
+                $0.id == task.id
+            }
+        )
+        let durableReminder = try XCTUnwrap(
+            verificationContext.fetch(FetchDescriptor<Reminder>()).first {
+                $0.id == reminder.id
+            }
+        )
+        XCTAssertFalse(durableTask.isComplete)
+        XCTAssertTrue(durableReminder.isComplete)
+    }
+
+    @MainActor
+    func testRestoreAfterHundredPercentReopensAdjustableProgress() throws {
+        _ = makeSettings()
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        try context.save()
+        try PlanCoordinator.completeTask(
+            task,
+            context: context,
+            reportedProgress: 100,
+            interactive: false
+        )
+
+        _ = try PlanCoordinator.restoreTask(task, context: context, interactive: false)
+
+        XCTAssertFalse(task.isComplete)
+        XCTAssertNil(task.completedAt)
+        XCTAssertEqual(task.manualProgressPercent, 90)
+        XCTAssertEqual(task.remainingMinutes, 6)
+    }
+
+    @MainActor
+    func testRestoreSaveFailureKeepsTaskDurablyCompleted() throws {
+        enum ExpectedFailure: Error { case save }
+
+        _ = makeSettings()
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        try context.save()
+        let completedAt = anchor.addingTimeInterval(3600)
+        try PlanCoordinator.completeTask(
+            task,
+            context: context,
+            reportedProgress: 100,
+            completedAt: completedAt,
+            interactive: false
+        )
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.restoreTask(
+                task,
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                interactive: false
+            )
+        )
+
+        XCTAssertTrue(task.isComplete)
+        XCTAssertEqual(task.completedAt, completedAt)
+        XCTAssertEqual(task.manualProgressPercent, 100)
+
+        let verificationContext = ModelContext(container)
+        let durableTask = try XCTUnwrap(
+            verificationContext.fetch(FetchDescriptor<FilumaTask>()).first {
+                $0.id == task.id
+            }
+        )
+        let durableBlocks = try verificationContext
+            .fetch(FetchDescriptor<ScheduledBlock>())
+            .filter { $0.task?.id == task.id }
+        XCTAssertTrue(durableTask.isComplete)
+        XCTAssertEqual(durableTask.completedAt, completedAt)
+        XCTAssertEqual(durableTask.manualProgressPercent, 100)
+        XCTAssertTrue(durableBlocks.isEmpty)
+    }
+
+    func testCompletionReceiptUsesCommittedTimestampForDeadlineCopy() {
+        let deadline = anchor.addingTimeInterval(48 * 3600)
+        let early = TaskCompletionReceipt(
+            taskID: UUID(),
+            title: "Early",
+            context: .school,
+            deadline: deadline,
+            completedAt: deadline.addingTimeInterval(-3 * 3600),
+            timeSpentMinutes: 0
+        )
+        let overdue = TaskCompletionReceipt(
+            taskID: UUID(),
+            title: "Overdue",
+            context: .work,
+            deadline: deadline,
+            completedAt: deadline.addingTimeInterval(90 * 60),
+            timeSpentMinutes: 0
+        )
+        let exact = TaskCompletionReceipt(
+            taskID: UUID(),
+            title: "Exact",
+            context: .personal,
+            deadline: deadline,
+            completedAt: deadline,
+            timeSpentMinutes: 0
+        )
+
+        XCTAssertEqual(early.deadlineSummary, "3h to spare")
+        XCTAssertEqual(overdue.deadlineSummary, "1h after deadline")
+        XCTAssertEqual(exact.deadlineSummary, "at deadline")
+        XCTAssertFalse(overdue.deadlineSummary.contains("wire"))
     }
 
     @MainActor
@@ -2831,17 +5032,35 @@ final class FilumaTests: XCTestCase {
         context.insert(original)
         context.insert(busy)
         try context.save()
+        var finalSaveFinished = false
+        var publishCount = 0
 
-        let replanned = PlanCoordinator.replanBusyTimeConflicts(
+        let replanned = try PlanCoordinator.replanBusyTimeConflicts(
             context: context,
-            interactive: false
+            now: anchor,
+            activeWorkSession: nil,
+            interactive: false,
+            save: { context in
+                try context.save()
+                finalSaveFinished = true
+            },
+            publish: { _, _ in
+                publishCount += 1
+                XCTAssertTrue(finalSaveFinished)
+                let fresh = ModelContext(self.container)
+                let durable = ((try? fresh.fetch(FetchDescriptor<ScheduledBlock>())) ?? [])
+                    .filter { $0.task?.id == task.id && !$0.isComplete }
+                XCTAssertTrue(durable.allSatisfy {
+                    $0.startTime >= busy.endTime || $0.endTime <= busy.startTime
+                })
+            }
         )
-        try context.save()
 
         let replacements = try context.fetch(FetchDescriptor<ScheduledBlock>()).filter {
             $0.task?.id == task.id && !$0.isComplete
         }
         XCTAssertEqual(replanned, 1)
+        XCTAssertEqual(publishCount, 1)
         XCTAssertFalse(replacements.isEmpty)
         XCTAssertFalse(replacements.contains { $0.id == original.id })
         XCTAssertTrue(replacements.allSatisfy {
@@ -2849,9 +5068,1240 @@ final class FilumaTests: XCTestCase {
         })
     }
 
+    @MainActor
+    func testBusyTimeReplanFailureRestoresHeldAndDurablePlanWithoutPublish() throws {
+        enum ExpectedFailure: Error { case save }
+
+        _ = makeSettings()
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        let original = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 60)
+        let busy = BusyEvent(
+            source: .appleCalendar,
+            sourceId: "coordinator-conflict-failure",
+            title: "New meeting",
+            startTime: original.startTime,
+            endTime: original.endTime
+        )
+        context.insert(original)
+        context.insert(busy)
+        try context.save()
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.replanBusyTimeConflicts(
+                context: context,
+                now: anchor,
+                activeWorkSession: nil,
+                interactive: false,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _, _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertEqual(task.scheduledBlocks.map(\.id), [original.id])
+        XCTAssertEqual(original.task?.id, task.id)
+        let fresh = ModelContext(container)
+        let durable = try fresh.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == task.id
+        }
+        XCTAssertEqual(durable.map(\.id), [original.id])
+        XCTAssertEqual(durable.first?.startTime, anchor)
+    }
+
+    @MainActor
+    func testBlockedTimeAddFailureRollsBackPlanAndSameObjectCanRetry() throws {
+        enum ExpectedFailure: Error { case save }
+
+        _ = makeSettings()
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        let original = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 60)
+        context.insert(original)
+        try context.save()
+        let blocked = BlockedTime(
+            label: "Class",
+            weekdays: [calendar.component(.weekday, from: anchor)],
+            startHour: calendar.component(.hour, from: anchor),
+            startMinute: calendar.component(.minute, from: anchor),
+            durationMinutes: 60
+        )
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.addBlockedTime(
+                blocked,
+                context: context,
+                now: anchor,
+                activeWorkSession: nil,
+                interactive: false,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _, _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<BlockedTime>()).isEmpty)
+        XCTAssertEqual(task.scheduledBlocks.map(\.id), [original.id])
+        var fresh = ModelContext(container)
+        XCTAssertTrue(try fresh.fetch(FetchDescriptor<BlockedTime>()).isEmpty)
+        XCTAssertEqual(try fresh.fetch(FetchDescriptor<ScheduledBlock>()).map(\.id), [original.id])
+
+        let replanned = try PlanCoordinator.addBlockedTime(
+            blocked,
+            context: context,
+            now: anchor,
+            activeWorkSession: nil,
+            interactive: false,
+            publish: { _, _ in publishCount += 1 }
+        )
+        XCTAssertEqual(replanned, 1)
+        XCTAssertEqual(publishCount, 1)
+        fresh = ModelContext(container)
+        XCTAssertEqual(try fresh.fetch(FetchDescriptor<BlockedTime>()).map(\.id), [blocked.id])
+        let durableBlocks = try fresh.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == task.id && !$0.isComplete
+        }
+        XCTAssertFalse(durableBlocks.contains { $0.id == original.id })
+        XCTAssertTrue(durableBlocks.allSatisfy {
+            $0.startTime >= original.endTime || $0.endTime <= original.startTime
+        })
+    }
+
+    @MainActor
+    func testBlockedTimeDeleteFailureKeepsRowAndPublishesOnlyAfterRetryCommit() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let blocked = BlockedTime(
+            label: "Class",
+            weekdays: [2, 4],
+            startHour: 10,
+            startMinute: 30,
+            durationMinutes: 90
+        )
+        context.insert(blocked)
+        try context.save()
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.deleteBlockedTime(
+                blocked,
+                context: context,
+                interactive: false,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _, _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertEqual(try context.fetch(FetchDescriptor<BlockedTime>()).map(\.id), [blocked.id])
+        var fresh = ModelContext(container)
+        XCTAssertEqual(try fresh.fetch(FetchDescriptor<BlockedTime>()).map(\.id), [blocked.id])
+
+        var finalSaveFinished = false
+        try PlanCoordinator.deleteBlockedTime(
+            blocked,
+            context: context,
+            interactive: false,
+            save: { context in
+                try context.save()
+                finalSaveFinished = true
+            },
+            publish: { _, _ in
+                publishCount += 1
+                XCTAssertTrue(finalSaveFinished)
+                let verification = ModelContext(self.container)
+                XCTAssertFalse(((try? verification.fetch(
+                    FetchDescriptor<BlockedTime>()
+                )) ?? []).contains { $0.id == blocked.id })
+            }
+        )
+
+        XCTAssertEqual(publishCount, 1)
+        fresh = ModelContext(container)
+        XCTAssertFalse(try fresh.fetch(FetchDescriptor<BlockedTime>()).contains {
+            $0.id == blocked.id
+        })
+    }
+
+    @MainActor
+    func testBlockBoundaryFailureRollsBackCatchUpWithoutPublish() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let settings = makeSettings()
+        settings.startBufferMinutes = 0
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        let missed = ScheduledBlock(
+            task: task,
+            startTime: anchor.addingTimeInterval(-2 * 3600),
+            durationMinutes: 60
+        )
+        context.insert(missed)
+        try context.save()
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.catchUpAtBlockBoundary(
+                context: context,
+                now: anchor,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _, _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertEqual(task.scheduledBlocks.map(\.id), [missed.id])
+        let fresh = ModelContext(container)
+        let durable = try fresh.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == task.id
+        }
+        XCTAssertEqual(durable.map(\.id), [missed.id])
+        XCTAssertEqual(durable.first?.startTime, missed.startTime)
+    }
+
+    @MainActor
+    func testForegroundPlanningFailureRollsBackMaterializationAndCatchUpWithoutPublish() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let settings = makeSettings()
+        settings.startBufferMinutes = 0
+        settings.planningRebuildPending = true
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        let missed = ScheduledBlock(
+            task: task,
+            startTime: anchor.addingTimeInterval(-2 * 3600),
+            durationMinutes: 60
+        )
+        let nextDeadline = anchor.addingTimeInterval(24 * 3600)
+        let template = TaskTemplate(
+            title: "Weekly review",
+            context: .work,
+            effortMinutes: 30,
+            nextDeadline: nextDeadline,
+            repeatUntil: nextDeadline
+        )
+        context.insert(missed)
+        context.insert(template)
+        try context.save()
+        let originalMarker = settings.lastFutileAutomaticRebalanceFingerprint
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try PlanCoordinator.refreshForegroundPlan(
+                context: context,
+                now: anchor,
+                activeWorkSession: nil,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _, _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertEqual(template.nextDeadline, nextDeadline)
+        XCTAssertEqual(task.scheduledBlocks.map(\.id), [missed.id])
+        XCTAssertEqual(settings.lastFutileAutomaticRebalanceFingerprint, originalMarker)
+        XCTAssertTrue(settings.planningRebuildPending)
+        XCTAssertEqual(try context.fetch(FetchDescriptor<FilumaTask>()).map(\.id), [task.id])
+        let fresh = ModelContext(container)
+        XCTAssertEqual(try fresh.fetch(FetchDescriptor<FilumaTask>()).map(\.id), [task.id])
+        XCTAssertEqual(try fresh.fetch(FetchDescriptor<ScheduledBlock>()).map(\.id), [missed.id])
+        XCTAssertTrue(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        ).planningRebuildPending)
+        let durableTemplate = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<TaskTemplate>()).first { $0.id == template.id }
+        )
+        XCTAssertEqual(durableTemplate.nextDeadline, nextDeadline)
+    }
+
+    @MainActor
+    func testForegroundRefreshConsumesDurablePlanningRebuildIntent() throws {
+        let settings = makeSettings()
+        settings.startBufferMinutes = 0
+        settings.deadlineBufferMinutes = 0
+        settings.planningRebuildPending = true
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 48)
+        let oldBlock = ScheduledBlock(
+            task: task,
+            startTime: anchor.addingTimeInterval(6 * 3600),
+            durationMinutes: 60
+        )
+        context.insert(oldBlock)
+        try context.save()
+        var publishCount = 0
+
+        let result = try PlanCoordinator.refreshForegroundPlan(
+            context: context,
+            now: anchor,
+            activeWorkSession: nil,
+            publish: { _, _ in publishCount += 1 }
+        )
+
+        XCTAssertEqual(publishCount, 1)
+        XCTAssertFalse(settings.planningRebuildPending)
+        XCTAssertEqual(result.catchUpSummary.adjustedTasks, 1)
+        XCTAssertFalse(task.scheduledBlocks.contains { $0.id == oldBlock.id })
+        XCTAssertEqual(
+            task.scheduledBlocks.filter { !$0.isComplete }.reduce(0) {
+                $0 + $1.durationMinutes
+            },
+            60
+        )
+
+        let fresh = ModelContext(container)
+        let durableSettings = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        XCTAssertFalse(durableSettings.planningRebuildPending)
+        let durableBlocks = try fresh.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == task.id && !$0.isComplete
+        }
+        XCTAssertFalse(durableBlocks.contains { $0.id == oldBlock.id })
+        XCTAssertEqual(durableBlocks.reduce(0) { $0 + $1.durationMinutes }, 60)
+    }
+
+    // MARK: - Tasks focus timeline
+
+    @MainActor
+    func testTaskFocusTimelineAdvancesHeroAndQueueAtOneBoundary() throws {
+        let firstTask = FilumaTask(
+            title: "First thread",
+            context: .school,
+            deadline: anchor.addingTimeInterval(24 * 3600),
+            effortMinutes: 30
+        )
+        let secondTask = FilumaTask(
+            title: "Second thread",
+            context: .work,
+            deadline: anchor.addingTimeInterval(36 * 3600),
+            effortMinutes: 45
+        )
+        let firstBlock = ScheduledBlock(
+            task: firstTask,
+            startTime: anchor.addingTimeInterval(-30 * 60),
+            durationMinutes: 30
+        )
+        let secondBlock = ScheduledBlock(
+            task: secondTask,
+            startTime: anchor,
+            durationMinutes: 45
+        )
+        context.insert(firstTask)
+        context.insert(secondTask)
+        context.insert(firstBlock)
+        context.insert(secondBlock)
+        try context.save()
+
+        let beforeBoundary = TaskFocusTimeline.blocks(
+            from: [firstTask, secondTask],
+            at: anchor.addingTimeInterval(-1)
+        )
+        XCTAssertEqual(beforeBoundary.map(\.id), [firstBlock.id, secondBlock.id])
+
+        let atBoundary = TaskFocusTimeline.blocks(
+            from: [firstTask, secondTask],
+            at: anchor
+        )
+        XCTAssertEqual(atBoundary.map(\.id), [secondBlock.id])
+        XCTAssertTrue(atBoundary.dropFirst().isEmpty)
+
+        let afterFinalBlock = TaskFocusTimeline.blocks(
+            from: [firstTask, secondTask],
+            at: secondBlock.endTime
+        )
+        XCTAssertTrue(afterFinalBlock.isEmpty)
+    }
+
+    // MARK: - Atomic capture coordination
+
+    @MainActor
+    func testTaskCaptureCommitsTaskBlocksAndWeeklyTemplateBeforePublishingReceipt() throws {
+        let settings = makeSettings()
+        settings.deadlineBufferMinutes = 0
+        settings.startBufferMinutes = 0
+        try context.save()
+        let deadline = anchor.addingTimeInterval(48 * 3600)
+        let repeatUntil = calendar.date(byAdding: .day, value: 14, to: deadline)!
+        let prepared = try CaptureCoordinator.prepareTask(
+            title: "  Draft methods  \n",
+            firstStep: "  Open the protocol  \n",
+            taskContext: .school,
+            deadline: deadline,
+            effortMinutes: 60,
+            preferredStart: anchor,
+            now: anchor,
+            context: context
+        )
+        XCTAssertTrue(try context.fetch(FetchDescriptor<FilumaTask>()).isEmpty)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<ScheduledBlock>()).isEmpty)
+        var publishedReceipt: TaskCaptureReceipt?
+        var finalSaveCount = 0
+
+        let receipt = try CaptureCoordinator.commit(
+            prepared,
+            repeatWeeklyUntil: repeatUntil,
+            context: context,
+            save: { context in
+                finalSaveCount += 1
+                try context.save()
+            },
+            publish: { _, receipt in publishedReceipt = receipt }
+        )
+
+        XCTAssertEqual(finalSaveCount, 1)
+        XCTAssertEqual(publishedReceipt, receipt)
+        XCTAssertEqual(receipt.taskID, prepared.task.id)
+        XCTAssertEqual(receipt.title, "Draft methods")
+        XCTAssertEqual(receipt.scheduledMinutes, 60)
+        XCTAssertEqual(receipt.unscheduledMinutes, 0)
+        XCTAssertEqual(receipt.scheduledBlockCount, 1)
+        XCTAssertEqual(receipt.firstBlockStart, anchor)
+        XCTAssertNotNil(receipt.templateID)
+        XCTAssertEqual(prepared.task.firstStep, "Open the protocol")
+
+        let heldTasks = try context.fetch(FetchDescriptor<FilumaTask>())
+        let heldBlocks = try context.fetch(FetchDescriptor<ScheduledBlock>())
+        let heldTemplates = try context.fetch(FetchDescriptor<TaskTemplate>())
+        XCTAssertEqual(heldTasks.map(\.id), [receipt.taskID])
+        XCTAssertEqual(heldBlocks.map(\.task?.id), [receipt.taskID])
+        XCTAssertEqual(
+            heldTemplates.map(\.id),
+            receipt.templateID.map { [$0] } ?? []
+        )
+        XCTAssertEqual(heldTemplates.first?.title, "Draft methods")
+        XCTAssertEqual(heldTemplates.first?.firstStep, "Open the protocol")
+
+        let fresh = ModelContext(container)
+        let durableTask = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<FilumaTask>()).first { $0.id == receipt.taskID }
+        )
+        let durableBlocks = try fresh.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == receipt.taskID
+        }
+        let durableTemplate = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<TaskTemplate>()).first { $0.id == receipt.templateID }
+        )
+        XCTAssertEqual(durableTask.title, receipt.title)
+        XCTAssertEqual(durableTask.templateId, durableTemplate.id)
+        XCTAssertEqual(durableBlocks.reduce(0) { $0 + $1.durationMinutes }, 60)
+        XCTAssertEqual(durableTemplate.repeatUntil, repeatUntil)
+    }
+
+    @MainActor
+    func testTaskCaptureSaveFailureRollsBackEveryCaptureRowAndDoesNotPublish() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let settings = makeSettings()
+        settings.deadlineBufferMinutes = 0
+        settings.startBufferMinutes = 0
+        let unrelatedReminder = Reminder(
+            title: "Already accepted",
+            dueDate: anchor.addingTimeInterval(3600)
+        )
+        context.insert(unrelatedReminder)
+        try context.save()
+        unrelatedReminder.isComplete = true
+
+        let prepared = try CaptureCoordinator.prepareTask(
+            title: "Atomic task",
+            firstStep: "Begin",
+            taskContext: .work,
+            deadline: anchor.addingTimeInterval(48 * 3600),
+            effortMinutes: 60,
+            preferredStart: anchor,
+            now: anchor,
+            context: context
+        )
+        let provisionalBlocks = scheduledBlocks(from: prepared.result)
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try CaptureCoordinator.commit(
+                prepared,
+                repeatWeeklyUntil: anchor.addingTimeInterval(21 * 86_400),
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _, _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertTrue(prepared.task.scheduledBlocks.isEmpty)
+        XCTAssertTrue(provisionalBlocks.allSatisfy { $0.task == nil })
+        XCTAssertTrue(try context.fetch(FetchDescriptor<FilumaTask>()).isEmpty)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<ScheduledBlock>()).isEmpty)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<TaskTemplate>()).isEmpty)
+
+        // A later unrelated save must not resurrect a rolled-back insertion.
+        try context.save()
+        let fresh = ModelContext(container)
+        XCTAssertTrue(try fresh.fetch(FetchDescriptor<FilumaTask>()).isEmpty)
+        XCTAssertTrue(try fresh.fetch(FetchDescriptor<ScheduledBlock>()).isEmpty)
+        XCTAssertTrue(try fresh.fetch(FetchDescriptor<TaskTemplate>()).isEmpty)
+        XCTAssertTrue(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<Reminder>()).first {
+                $0.id == unrelatedReminder.id
+            }
+        ).isComplete, "capture preflight must preserve unrelated accepted edits")
+    }
+
+    @MainActor
+    func testTaskCapturePreparationFetchFailureLeavesTheExistingPlanUntouched() throws {
+        enum ExpectedFailure: Error { case fetch }
+
+        _ = makeSettings()
+        let existingTask = makeTask(effort: 45, deadlineHoursFromAnchor: 24)
+        let existingBlock = ScheduledBlock(
+            task: existingTask,
+            startTime: anchor,
+            durationMinutes: 45
+        )
+        context.insert(existingBlock)
+        try context.save()
+
+        XCTAssertThrowsError(
+            try CaptureCoordinator.prepareTask(
+                title: "Never materialized",
+                firstStep: "",
+                taskContext: .personal,
+                deadline: anchor.addingTimeInterval(48 * 3600),
+                effortMinutes: 30,
+                now: anchor,
+                context: context,
+                load: { _ in throw ExpectedFailure.fetch }
+            )
+        )
+
+        XCTAssertEqual(try context.fetch(FetchDescriptor<FilumaTask>()).map(\.id), [existingTask.id])
+        XCTAssertEqual(try context.fetch(FetchDescriptor<ScheduledBlock>()).map(\.id), [existingBlock.id])
+        let fresh = ModelContext(container)
+        XCTAssertEqual(try fresh.fetch(FetchDescriptor<FilumaTask>()).map(\.id), [existingTask.id])
+        XCTAssertEqual(try fresh.fetch(FetchDescriptor<ScheduledBlock>()).map(\.id), [existingBlock.id])
+    }
+
+    @MainActor
+    func testTaskCapturePreparationRejectsBlankTitleAndMissingSettings() throws {
+        XCTAssertThrowsError(
+            try CaptureCoordinator.prepareTask(
+                title: " \n ",
+                firstStep: "Anything",
+                taskContext: .personal,
+                deadline: anchor.addingTimeInterval(3600),
+                effortMinutes: 30,
+                now: anchor,
+                context: context
+            )
+        ) { error in
+            XCTAssertEqual(error as? CaptureCoordinatorError, .emptyTitle)
+        }
+        XCTAssertThrowsError(
+            try CaptureCoordinator.prepareTask(
+                title: "Needs settings",
+                firstStep: "",
+                taskContext: .personal,
+                deadline: anchor.addingTimeInterval(3600),
+                effortMinutes: 30,
+                now: anchor,
+                context: context
+            )
+        ) { error in
+            XCTAssertEqual(error as? CaptureCoordinatorError, .missingSettings)
+        }
+        XCTAssertTrue(try context.fetch(FetchDescriptor<FilumaTask>()).isEmpty)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<ScheduledBlock>()).isEmpty)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<UserSettings>()).isEmpty)
+    }
+
+    @MainActor
+    func testMakeRoomReceiptReflectsTheFinalRebalancedBlocks() throws {
+        let settings = makeSettings()
+        settings.deadlineBufferMinutes = 0
+        settings.startBufferMinutes = 0
+        let laterTask = FilumaTask(
+            title: "Later work",
+            context: .school,
+            deadline: anchor.addingTimeInterval(24 * 3600),
+            effortMinutes: 60
+        )
+        let occupied = ScheduledBlock(
+            task: laterTask,
+            startTime: anchor,
+            durationMinutes: 60
+        )
+        context.insert(laterTask)
+        context.insert(occupied)
+        try context.save()
+
+        let prepared = try CaptureCoordinator.prepareTask(
+            title: "Urgent work",
+            firstStep: "Open it",
+            taskContext: .work,
+            deadline: anchor.addingTimeInterval(60 * 60),
+            effortMinutes: 30,
+            preferredStart: anchor,
+            now: anchor,
+            context: context
+        )
+        guard case .noSlots = prepared.result else {
+            return XCTFail("The occupied urgent window should require Make Room")
+        }
+        var publishedReceipt: TaskCaptureReceipt?
+
+        let receipt = try CaptureCoordinator.commitMakingRoom(
+            prepared,
+            now: anchor,
+            context: context,
+            publish: { _, receipt in publishedReceipt = receipt }
+        )
+
+        XCTAssertEqual(publishedReceipt, receipt)
+        XCTAssertEqual(receipt.taskID, prepared.task.id)
+        XCTAssertEqual(receipt.scheduledMinutes, 30)
+        XCTAssertEqual(receipt.unscheduledMinutes, 0)
+        XCTAssertEqual(receipt.scheduledBlockCount, 1)
+        XCTAssertEqual(receipt.firstBlockStart, anchor)
+
+        let heldBlocks = try context.fetch(FetchDescriptor<ScheduledBlock>())
+        let urgentHeld = heldBlocks.filter { $0.task?.id == prepared.task.id }
+        let laterHeld = heldBlocks.filter { $0.task?.id == laterTask.id }
+        XCTAssertEqual(urgentHeld.reduce(0) { $0 + $1.durationMinutes }, receipt.scheduledMinutes)
+        XCTAssertEqual(laterHeld.reduce(0) { $0 + $1.durationMinutes }, 60)
+        XCTAssertFalse(heldBlocks.contains { $0.id == occupied.id })
+
+        let fresh = ModelContext(container)
+        let urgentDurable = try fresh.fetch(FetchDescriptor<ScheduledBlock>()).filter {
+            $0.task?.id == receipt.taskID
+        }
+        XCTAssertEqual(urgentDurable.reduce(0) { $0 + $1.durationMinutes }, receipt.scheduledMinutes)
+        XCTAssertEqual(
+            max(0, 30 - urgentDurable.reduce(0) { $0 + $1.durationMinutes }),
+            receipt.unscheduledMinutes
+        )
+    }
+
+    @MainActor
+    func testMakeRoomSaveFailureRestoresHeldAndDurablePlanWithoutPublishing() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let settings = makeSettings()
+        settings.deadlineBufferMinutes = 0
+        settings.startBufferMinutes = 0
+        let laterTask = FilumaTask(
+            title: "Keep this plan",
+            context: .school,
+            deadline: anchor.addingTimeInterval(24 * 3600),
+            effortMinutes: 60
+        )
+        let originalBlock = ScheduledBlock(
+            task: laterTask,
+            startTime: anchor,
+            durationMinutes: 60
+        )
+        context.insert(laterTask)
+        context.insert(originalBlock)
+        try context.save()
+        let originalMarker = settings.lastFutileAutomaticRebalanceFingerprint
+
+        let prepared = try CaptureCoordinator.prepareTask(
+            title: "Rejected urgent work",
+            firstStep: "Open it",
+            taskContext: .work,
+            deadline: anchor.addingTimeInterval(60 * 60),
+            effortMinutes: 30,
+            preferredStart: anchor,
+            now: anchor,
+            context: context
+        )
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try CaptureCoordinator.commitMakingRoom(
+                prepared,
+                repeatWeeklyUntil: anchor.addingTimeInterval(21 * 86_400),
+                now: anchor,
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _, _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertEqual(laterTask.scheduledBlocks.map(\.id), [originalBlock.id])
+        XCTAssertEqual(settings.lastFutileAutomaticRebalanceFingerprint, originalMarker)
+        XCTAssertTrue(prepared.task.scheduledBlocks.isEmpty)
+        XCTAssertEqual(try context.fetch(FetchDescriptor<FilumaTask>()).map(\.id), [laterTask.id])
+        XCTAssertEqual(try context.fetch(FetchDescriptor<ScheduledBlock>()).map(\.id), [originalBlock.id])
+        XCTAssertTrue(try context.fetch(FetchDescriptor<TaskTemplate>()).isEmpty)
+
+        // Prove the repaired held projection cannot resurrect attempted rows.
+        try context.save()
+        let fresh = ModelContext(container)
+        XCTAssertEqual(try fresh.fetch(FetchDescriptor<FilumaTask>()).map(\.id), [laterTask.id])
+        XCTAssertEqual(try fresh.fetch(FetchDescriptor<ScheduledBlock>()).map(\.id), [originalBlock.id])
+        XCTAssertTrue(try fresh.fetch(FetchDescriptor<TaskTemplate>()).isEmpty)
+    }
+
+    @MainActor
+    func testReminderCaptureSavesTrimmedRowBeforePublishingReceipt() throws {
+        var publishedReceipt: ReminderCaptureReceipt?
+        var finalSaveCount = 0
+
+        let receipt = try CaptureCoordinator.saveReminder(
+            title: "  Take meds  \n",
+            dueDate: anchor,
+            context: context,
+            save: { context in
+                finalSaveCount += 1
+                try context.save()
+            },
+            publish: { _, receipt in publishedReceipt = receipt }
+        )
+
+        XCTAssertEqual(finalSaveCount, 1)
+        XCTAssertEqual(publishedReceipt, receipt)
+        XCTAssertEqual(receipt.title, "Take meds")
+        XCTAssertEqual(receipt.dueDate, anchor)
+        XCTAssertFalse(receipt.notificationID.isEmpty)
+        XCTAssertEqual(
+            try context.fetch(FetchDescriptor<Reminder>()).map(\.id),
+            [receipt.reminderID]
+        )
+
+        let fresh = ModelContext(container)
+        let durable = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<Reminder>()).first { $0.id == receipt.reminderID }
+        )
+        XCTAssertEqual(durable.title, receipt.title)
+        XCTAssertEqual(durable.dueDate, receipt.dueDate)
+        XCTAssertEqual(durable.notificationId, receipt.notificationID)
+    }
+
+    @MainActor
+    func testReminderCaptureSaveFailureLeavesNoRowAndDoesNotPublish() throws {
+        enum ExpectedFailure: Error { case save }
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try CaptureCoordinator.saveReminder(
+                title: "  Not durable  ",
+                dueDate: anchor,
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _, _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<Reminder>()).isEmpty)
+        try context.save()
+        let fresh = ModelContext(container)
+        XCTAssertTrue(try fresh.fetch(FetchDescriptor<Reminder>()).isEmpty)
+    }
+
+    // MARK: - Atomic reminder mutation coordination
+
+    @MainActor
+    func testReminderMutationsPublishScalarReceiptsOnlyAfterDurableSuccess() throws {
+        let reminder = Reminder(
+            title: "Take meds",
+            dueDate: anchor.addingTimeInterval(3600)
+        )
+        context.insert(reminder)
+        try context.save()
+        let expectedDueDate = reminder.dueDate
+        var publishedReceipts: [ReminderMutationReceipt] = []
+
+        let completed = try ReminderMutationCoordinator.apply(
+            .complete,
+            to: reminder,
+            context: context,
+            publish: { receipt in
+                publishedReceipts.append(receipt)
+                let fresh = ModelContext(self.container)
+                let durable = try? fresh.fetch(FetchDescriptor<Reminder>())
+                    .first { $0.id == receipt.reminderID }
+                XCTAssertEqual(durable?.isComplete, true)
+            }
+        )
+        XCTAssertEqual(completed.mutation, .complete)
+        XCTAssertTrue(reminder.isComplete)
+
+        let restored = try ReminderMutationCoordinator.apply(
+            .restore,
+            to: reminder,
+            context: context,
+            publish: { receipt in
+                publishedReceipts.append(receipt)
+                let fresh = ModelContext(self.container)
+                let durable = try? fresh.fetch(FetchDescriptor<Reminder>())
+                    .first { $0.id == receipt.reminderID }
+                XCTAssertEqual(durable?.isComplete, false)
+            }
+        )
+        XCTAssertEqual(restored.mutation, .restore)
+        XCTAssertFalse(reminder.isComplete)
+
+        let deleted = try ReminderMutationCoordinator.apply(
+            .delete,
+            to: reminder,
+            context: context,
+            publish: { receipt in
+                publishedReceipts.append(receipt)
+                let fresh = ModelContext(self.container)
+                let durableIDs = (try? fresh.fetch(FetchDescriptor<Reminder>()).map(\.id)) ?? []
+                XCTAssertFalse(durableIDs.contains(receipt.reminderID))
+            }
+        )
+
+        XCTAssertEqual(publishedReceipts.map(\.mutation), [.complete, .restore, .delete])
+        XCTAssertEqual(deleted.reminderID, completed.reminderID)
+        XCTAssertEqual(deleted.title, "Take meds")
+        XCTAssertEqual(deleted.dueDate, expectedDueDate)
+        XCTAssertEqual(deleted.notificationID, completed.notificationID)
+        let fresh = ModelContext(container)
+        XCTAssertFalse(
+            try fresh.fetch(FetchDescriptor<Reminder>()).contains {
+                $0.id == deleted.reminderID
+            }
+        )
+    }
+
+    @MainActor
+    func testReminderCompleteFailureRepairsHeldAndFreshStateThenSameContextRetrySucceeds() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let reminder = Reminder(title: "Complete me", dueDate: anchor)
+        let unrelated = Reminder(
+            title: "Earlier accepted edit",
+            dueDate: anchor.addingTimeInterval(3600)
+        )
+        context.insert(reminder)
+        context.insert(unrelated)
+        try context.save()
+        unrelated.isComplete = true
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try ReminderMutationCoordinator.apply(
+                .complete,
+                to: reminder,
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertFalse(reminder.isComplete)
+        XCTAssertTrue(unrelated.isComplete)
+        var fresh = ModelContext(container)
+        var durable = try fresh.fetch(FetchDescriptor<Reminder>())
+        XCTAssertFalse(try XCTUnwrap(durable.first { $0.id == reminder.id }).isComplete)
+        XCTAssertTrue(try XCTUnwrap(durable.first { $0.id == unrelated.id }).isComplete)
+
+        _ = try ReminderMutationCoordinator.apply(
+            .complete,
+            to: reminder,
+            context: context,
+            publish: { _ in publishCount += 1 }
+        )
+
+        XCTAssertEqual(publishCount, 1)
+        XCTAssertTrue(reminder.isComplete)
+        fresh = ModelContext(container)
+        durable = try fresh.fetch(FetchDescriptor<Reminder>())
+        XCTAssertTrue(try XCTUnwrap(durable.first { $0.id == reminder.id }).isComplete)
+        XCTAssertTrue(try XCTUnwrap(durable.first { $0.id == unrelated.id }).isComplete)
+    }
+
+    @MainActor
+    func testReminderRestoreFailureRepairsHeldAndFreshStateThenSameContextRetrySucceeds() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let reminder = Reminder(title: "Restore me", dueDate: anchor)
+        reminder.isComplete = true
+        let unrelated = Reminder(
+            title: "Earlier accepted edit",
+            dueDate: anchor.addingTimeInterval(3600)
+        )
+        context.insert(reminder)
+        context.insert(unrelated)
+        try context.save()
+        unrelated.isComplete = true
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try ReminderMutationCoordinator.apply(
+                .restore,
+                to: reminder,
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertTrue(reminder.isComplete)
+        XCTAssertTrue(unrelated.isComplete)
+        var fresh = ModelContext(container)
+        var durable = try fresh.fetch(FetchDescriptor<Reminder>())
+        XCTAssertTrue(try XCTUnwrap(durable.first { $0.id == reminder.id }).isComplete)
+        XCTAssertTrue(try XCTUnwrap(durable.first { $0.id == unrelated.id }).isComplete)
+
+        _ = try ReminderMutationCoordinator.apply(
+            .restore,
+            to: reminder,
+            context: context,
+            publish: { _ in publishCount += 1 }
+        )
+
+        XCTAssertEqual(publishCount, 1)
+        XCTAssertFalse(reminder.isComplete)
+        fresh = ModelContext(container)
+        durable = try fresh.fetch(FetchDescriptor<Reminder>())
+        XCTAssertFalse(try XCTUnwrap(durable.first { $0.id == reminder.id }).isComplete)
+        XCTAssertTrue(try XCTUnwrap(durable.first { $0.id == unrelated.id }).isComplete)
+    }
+
+    @MainActor
+    func testReminderDeleteFailureKeepsHeldAndFreshRowThenSameContextRetrySucceeds() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let reminder = Reminder(title: "Delete me", dueDate: anchor)
+        reminder.isComplete = true
+        let reminderID = reminder.id
+        let notificationID = reminder.notificationId
+        let unrelated = Reminder(
+            title: "Earlier accepted edit",
+            dueDate: anchor.addingTimeInterval(3600)
+        )
+        context.insert(reminder)
+        context.insert(unrelated)
+        try context.save()
+        unrelated.isComplete = true
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try ReminderMutationCoordinator.apply(
+                .delete,
+                to: reminder,
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertEqual(reminder.id, reminderID)
+        XCTAssertEqual(reminder.notificationId, notificationID)
+        XCTAssertTrue(reminder.isComplete)
+        XCTAssertTrue(unrelated.isComplete)
+        XCTAssertTrue(
+            try context.fetch(FetchDescriptor<Reminder>()).contains {
+                $0.id == reminderID
+            }
+        )
+        var fresh = ModelContext(container)
+        var durable = try fresh.fetch(FetchDescriptor<Reminder>())
+        XCTAssertTrue(durable.contains { $0.id == reminderID && $0.isComplete })
+        XCTAssertTrue(durable.contains { $0.id == unrelated.id && $0.isComplete })
+
+        var publishedReceipt: ReminderMutationReceipt?
+        _ = try ReminderMutationCoordinator.apply(
+            .delete,
+            to: reminder,
+            context: context,
+            publish: { receipt in
+                publishCount += 1
+                publishedReceipt = receipt
+            }
+        )
+
+        XCTAssertEqual(publishCount, 1)
+        XCTAssertEqual(publishedReceipt?.mutation, .delete)
+        XCTAssertEqual(publishedReceipt?.reminderID, reminderID)
+        XCTAssertEqual(publishedReceipt?.notificationID, notificationID)
+        fresh = ModelContext(container)
+        durable = try fresh.fetch(FetchDescriptor<Reminder>())
+        XCTAssertFalse(durable.contains { $0.id == reminderID })
+        XCTAssertTrue(durable.contains { $0.id == unrelated.id && $0.isComplete })
+    }
+
+    // MARK: - Atomic bulk capture coordination
+
+    @MainActor
+    func testBulkCaptureSchedulesSequentiallyWithoutOverlapAndReturnsFactualReceipt() throws {
+        let settings = makeSettings()
+        settings.deadlineBufferMinutes = 0
+        settings.startBufferMinutes = 0
+        try context.save()
+        let drafts = [
+            BulkTaskCaptureDraft(
+                title: "  First row  ",
+                context: .school,
+                deadline: anchor.addingTimeInterval(60 * 60),
+                effortMinutes: 30
+            ),
+            BulkTaskCaptureDraft(
+                title: "Second row",
+                context: .work,
+                deadline: anchor.addingTimeInterval(90 * 60),
+                effortMinutes: 30
+            ),
+            BulkTaskCaptureDraft(
+                title: "Third row",
+                context: .personal,
+                deadline: anchor.addingTimeInterval(90 * 60),
+                effortMinutes: 60
+            )
+        ]
+        var publishCount = 0
+        var publishedReceipt: BulkCaptureReceipt?
+
+        let receipt = try CaptureCoordinator.commitBulk(
+            drafts,
+            now: anchor,
+            context: context,
+            publish: { _, receipt in
+                publishCount += 1
+                publishedReceipt = receipt
+            }
+        )
+
+        XCTAssertEqual(publishCount, 1)
+        XCTAssertEqual(publishedReceipt, receipt)
+        XCTAssertEqual(receipt.taskReceipts.map(\.title), [
+            "First row", "Second row", "Third row"
+        ])
+        XCTAssertEqual(receipt.taskReceipts.map(\.scheduledMinutes), [30, 30, 30])
+        XCTAssertEqual(receipt.taskReceipts.map(\.unscheduledMinutes), [0, 0, 30])
+        XCTAssertEqual(receipt.fullyScheduledCount, 2)
+        XCTAssertEqual(receipt.needsAttentionCount, 1)
+
+        let heldTasks = try context.fetch(FetchDescriptor<FilumaTask>())
+        let heldBlocks = try context.fetch(FetchDescriptor<ScheduledBlock>())
+            .sorted { $0.startTime < $1.startTime }
+        XCTAssertEqual(Set(heldTasks.map(\.id)), Set(receipt.taskReceipts.map(\.taskID)))
+        XCTAssertTrue(heldTasks.allSatisfy { $0.source == .bulkEntry })
+        XCTAssertEqual(heldBlocks.count, 3)
+        for pair in zip(heldBlocks, heldBlocks.dropFirst()) {
+            XCTAssertLessThanOrEqual(pair.0.endTime, pair.1.startTime)
+        }
+        for taskReceipt in receipt.taskReceipts {
+            let minutes = heldBlocks
+                .filter { $0.task?.id == taskReceipt.taskID }
+                .reduce(0) { $0 + $1.durationMinutes }
+            XCTAssertEqual(minutes, taskReceipt.scheduledMinutes)
+        }
+
+        let fresh = ModelContext(container)
+        let durableTasks = try fresh.fetch(FetchDescriptor<FilumaTask>())
+        let durableBlocks = try fresh.fetch(FetchDescriptor<ScheduledBlock>())
+        XCTAssertEqual(Set(durableTasks.map(\.id)), Set(receipt.taskReceipts.map(\.taskID)))
+        XCTAssertTrue(durableTasks.allSatisfy { $0.source == .bulkEntry })
+        XCTAssertEqual(Set(durableBlocks.compactMap(\.task?.id)), Set(receipt.taskReceipts.map(\.taskID)))
+    }
+
+    @MainActor
+    func testBulkCaptureSaveFailureIsAllOrNothingInHeldAndFreshContexts() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let settings = makeSettings()
+        settings.deadlineBufferMinutes = 0
+        settings.startBufferMinutes = 0
+        let existingTask = makeTask(effort: 30, deadlineHoursFromAnchor: 72)
+        let existingBlock = ScheduledBlock(
+            task: existingTask,
+            startTime: anchor.addingTimeInterval(8 * 3600),
+            durationMinutes: 30
+        )
+        context.insert(existingBlock)
+        try context.save()
+        let drafts = [
+            BulkTaskCaptureDraft(
+                title: "Rejected one",
+                context: .school,
+                deadline: anchor.addingTimeInterval(24 * 3600),
+                effortMinutes: 30
+            ),
+            BulkTaskCaptureDraft(
+                title: "Rejected two",
+                context: .work,
+                deadline: anchor.addingTimeInterval(36 * 3600),
+                effortMinutes: 60
+            )
+        ]
+        var publishCount = 0
+
+        XCTAssertThrowsError(
+            try CaptureCoordinator.commitBulk(
+                drafts,
+                now: anchor,
+                context: context,
+                save: { _ in throw ExpectedFailure.save },
+                publish: { _, _ in publishCount += 1 }
+            )
+        )
+
+        XCTAssertEqual(publishCount, 0)
+        XCTAssertEqual(try context.fetch(FetchDescriptor<FilumaTask>()).map(\.id), [existingTask.id])
+        XCTAssertEqual(try context.fetch(FetchDescriptor<ScheduledBlock>()).map(\.id), [existingBlock.id])
+        XCTAssertEqual(existingTask.scheduledBlocks.map(\.id), [existingBlock.id])
+        XCTAssertTrue(try context.fetch(FetchDescriptor<FilumaTask>()).allSatisfy {
+            $0.source != .bulkEntry
+        })
+
+        // A later save cannot resurrect any rolled-back bulk graph.
+        try context.save()
+        let fresh = ModelContext(container)
+        XCTAssertEqual(try fresh.fetch(FetchDescriptor<FilumaTask>()).map(\.id), [existingTask.id])
+        XCTAssertEqual(try fresh.fetch(FetchDescriptor<ScheduledBlock>()).map(\.id), [existingBlock.id])
+        XCTAssertTrue(try fresh.fetch(FetchDescriptor<FilumaTask>()).allSatisfy {
+            $0.source != .bulkEntry
+        })
+    }
+
+    @MainActor
+    func testBulkCaptureReadAndValidationFailuresLeaveTheStoreUnchanged() throws {
+        enum ExpectedFailure: Error { case fetch }
+
+        let settings = makeSettings()
+        let existingTask = makeTask(effort: 45, deadlineHoursFromAnchor: 48)
+        let existingBlock = ScheduledBlock(
+            task: existingTask,
+            startTime: anchor,
+            durationMinutes: 45
+        )
+        context.insert(existingBlock)
+        try context.save()
+        let baselineTaskIDs = [existingTask.id]
+        let baselineBlockIDs = [existingBlock.id]
+        let valid = BulkTaskCaptureDraft(
+            title: "Read should fail",
+            context: .personal,
+            deadline: anchor.addingTimeInterval(24 * 3600),
+            effortMinutes: 30
+        )
+
+        XCTAssertThrowsError(
+            try CaptureCoordinator.commitBulk(
+                [valid],
+                now: anchor,
+                context: context,
+                load: { _ in throw ExpectedFailure.fetch },
+                publish: { _, _ in XCTFail("read failure must not publish") }
+            )
+        )
+
+        var validationLoadCount = 0
+        XCTAssertThrowsError(
+            try CaptureCoordinator.commitBulk(
+                [
+                    valid,
+                    BulkTaskCaptureDraft(
+                        title: " \n ",
+                        context: .work,
+                        deadline: anchor.addingTimeInterval(24 * 3600),
+                        effortMinutes: 30
+                    )
+                ],
+                now: anchor,
+                context: context,
+                load: { _ in
+                    validationLoadCount += 1
+                    return TaskCapturePlanningInput(
+                        settings: settings,
+                        allBlocks: [existingBlock],
+                        blockedTimes: [],
+                        busyEvents: []
+                    )
+                }
+            )
+        ) { error in
+            XCTAssertEqual(error as? CaptureCoordinatorError, .emptyTitle)
+        }
+        XCTAssertThrowsError(
+            try CaptureCoordinator.commitBulk(
+                [],
+                now: anchor,
+                context: context
+            )
+        ) { error in
+            XCTAssertEqual(error as? CaptureCoordinatorError, .emptyBatch)
+        }
+        XCTAssertThrowsError(
+            try CaptureCoordinator.commitBulk(
+                [
+                    BulkTaskCaptureDraft(
+                        title: "No effort",
+                        context: .school,
+                        deadline: anchor.addingTimeInterval(24 * 3600),
+                        effortMinutes: 0
+                    )
+                ],
+                now: anchor,
+                context: context
+            )
+        ) { error in
+            XCTAssertEqual(error as? CaptureCoordinatorError, .invalidEffortMinutes)
+        }
+
+        XCTAssertEqual(validationLoadCount, 0)
+        XCTAssertEqual(try context.fetch(FetchDescriptor<FilumaTask>()).map(\.id), baselineTaskIDs)
+        XCTAssertEqual(try context.fetch(FetchDescriptor<ScheduledBlock>()).map(\.id), baselineBlockIDs)
+        let fresh = ModelContext(container)
+        XCTAssertEqual(try fresh.fetch(FetchDescriptor<FilumaTask>()).map(\.id), baselineTaskIDs)
+        XCTAssertEqual(try fresh.fetch(FetchDescriptor<ScheduledBlock>()).map(\.id), baselineBlockIDs)
+    }
+
+    @MainActor
+    func testBulkCapturePublishesExactlyOnceAfterRowsAreDurable() throws {
+        let settings = makeSettings()
+        settings.deadlineBufferMinutes = 0
+        settings.startBufferMinutes = 0
+        try context.save()
+        var finalSaveFinished = false
+        var publishCount = 0
+        var durableIDsSeenDuringPublish: [UUID] = []
+
+        let receipt = try CaptureCoordinator.commitBulk(
+            [
+                BulkTaskCaptureDraft(
+                    title: "Durable before publish",
+                    context: .personal,
+                    deadline: anchor.addingTimeInterval(24 * 3600),
+                    effortMinutes: 30
+                )
+            ],
+            now: anchor,
+            context: context,
+            save: { context in
+                try context.save()
+                finalSaveFinished = true
+            },
+            publish: { _, _ in
+                publishCount += 1
+                XCTAssertTrue(finalSaveFinished)
+                let fresh = ModelContext(self.container)
+                durableIDsSeenDuringPublish = (
+                    try? fresh.fetch(FetchDescriptor<FilumaTask>()).map(\.id)
+                ) ?? []
+            }
+        )
+
+        XCTAssertEqual(publishCount, 1)
+        XCTAssertEqual(durableIDsSeenDuringPublish, receipt.taskReceipts.map(\.taskID))
+    }
+
     // MARK: - Data export
 
     func testDataExportRoundTrips() throws {
+        let settings = makeSettings()
+        settings.wakeHour = 7
+        settings.dailyFocusMinutes = 240
+        settings.importFromAppleCalendar = true
+        settings.excludedCalendarIds = ["family-calendar"]
+        settings.googleAccountEmail = "person@example.com"
+        settings.morningPreviewEnabled = false
         let task = makeTask(effort: 90, deadlineHoursFromAnchor: 48)
         task.firstStep = "Open the doc"
         let block = ScheduledBlock(task: task, startTime: anchor, durationMinutes: 45)
@@ -2880,13 +6330,23 @@ final class FilumaTests: XCTestCase {
         decoder.dateDecodingStrategy = .iso8601
         let export = try decoder.decode(DataExporter.Export.self, from: data)
 
-        XCTAssertEqual(export.version, 2)
+        XCTAssertEqual(export.version, 4)
         XCTAssertEqual(export.tasks.count, 1)
         XCTAssertEqual(export.blocks.count, 1)
         XCTAssertEqual(export.workSessions.count, 1)
         XCTAssertEqual(export.reminders.count, 1)
         XCTAssertEqual(export.blockedTimes.count, 1)
         XCTAssertEqual(export.templates.count, 1)
+
+        let exportedSettings = try XCTUnwrap(export.settings)
+        XCTAssertEqual(exportedSettings.id, settings.id)
+        XCTAssertEqual(exportedSettings.wakeHour, 7)
+        XCTAssertEqual(exportedSettings.dailyFocusMinutes, 240)
+        XCTAssertTrue(exportedSettings.importFromAppleCalendar)
+        XCTAssertEqual(exportedSettings.excludedCalendarIds, ["family-calendar"])
+        XCTAssertEqual(exportedSettings.googleAccountEmail, "person@example.com")
+        XCTAssertFalse(exportedSettings.morningPreviewEnabled)
+        XCTAssertNotNil(HearthAccent(rawValue: exportedSettings.hearthAccent))
 
         let exportedTask = try XCTUnwrap(export.tasks.first)
         XCTAssertEqual(exportedTask.id, task.id)
@@ -2896,12 +6356,13 @@ final class FilumaTests: XCTestCase {
         XCTAssertEqual(export.workSessions.first?.scheduledBlockId, block.id)
         XCTAssertEqual(export.blockedTimes.first?.weekdays, [2, 4])
 
-        // Export v1 had the same envelope but no session-to-block link. The
-        // new optional field must keep those existing backups decodable.
+        // Export v1 had the same core envelope but no settings record or
+        // session-to-block link. Both additions stay backward-decodable.
         var legacyObject = try XCTUnwrap(
             JSONSerialization.jsonObject(with: data) as? [String: Any]
         )
         legacyObject["version"] = 1
+        legacyObject.removeValue(forKey: "settings")
         var legacySessions = try XCTUnwrap(
             legacyObject["workSessions"] as? [[String: Any]]
         )
@@ -2911,6 +6372,7 @@ final class FilumaTests: XCTestCase {
         let legacyExport = try decoder.decode(DataExporter.Export.self, from: legacyData)
 
         XCTAssertEqual(legacyExport.version, 1)
+        XCTAssertNil(legacyExport.settings)
         XCTAssertNil(legacyExport.workSessions.first?.scheduledBlockId)
     }
 }

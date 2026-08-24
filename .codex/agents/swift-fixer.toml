@@ -14,7 +14,7 @@ You fix specific, scoped Swift, SwiftUI, and SwiftData issues in Filuma.
 ## Verify before returning
 
 After editing, confirm your fix compiles:
-   xcodebuild build -scheme Filuma -destination 'platform=iOS Simulator,name=iPhone 16' 2>&1 | tail -30
+   set -o pipefail; DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer xcodebuild build -scheme Filuma -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest' 2>&1 | tail -30
 
 ## What to return
 

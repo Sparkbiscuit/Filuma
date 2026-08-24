@@ -61,9 +61,11 @@ daily focus limit if you set one.
 - **Today widget** — a Lock Screen ring of blocks done vs planned (and your
   streak on quiet days), plus a Home Screen card with today's count, progress,
   and what's next. Tapping jumps straight into the next block's timer.
-- **Data export** — Settings → Export my data writes everything Filuma knows to
-  a plain, pretty-printed JSON file you can share, archive, or parse. Your
-  data is yours.
+- **Data export** — Settings → Export my data writes your tasks, scheduled
+  blocks, work history, reminders, recurring and blocked time, planning
+  preferences, and integration choices to plain, pretty-printed JSON. OAuth
+  credentials, sync cursors, and imported calendar-event copies stay out of
+  the portable file. Your authored data is yours.
 - **Auto-scheduling** — work is chunked into blocks (configurable min/max size) and
   packed into the gaps that really exist before your buffered deadline. Fragmented
   calendars and daily focus limits are reflected in both placement and pace.

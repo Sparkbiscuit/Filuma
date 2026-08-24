@@ -420,6 +420,32 @@ struct StreakCalculator {
 
 // MARK: - UserSettings
 
+/// The scheduling values a brand-new Filuma plan starts from.
+///
+/// Keep this outside `UserSettings` so changing how onboarding applies the
+/// defaults never changes the SwiftData model schema.
+struct UserSettingsSchedulingDefaults: Equatable, Sendable {
+    let wakeHour: Int
+    let wakeMinute: Int
+    let sleepHour: Int
+    let sleepMinute: Int
+    let minBlockMinutes: Int
+    let maxBlockMinutes: Int
+    let deadlineBufferMinutes: Int
+    let startBufferMinutes: Int
+
+    static let fresh = UserSettingsSchedulingDefaults(
+        wakeHour: 8,
+        wakeMinute: 0,
+        sleepHour: 23,
+        sleepMinute: 0,
+        minBlockMinutes: 30,
+        maxBlockMinutes: 90,
+        deadlineBufferMinutes: 120,
+        startBufferMinutes: 15
+    )
+}
+
 @Model
 final class UserSettings {
     var id: UUID
@@ -438,6 +464,10 @@ final class UserSettings {
     /// The last plan state where automatic scheduling proved no more work fit.
     /// Optional with an inline default so existing stores migrate safely.
     var lastFutileAutomaticRebalanceFingerprint: String? = nil
+    /// A planning preference was accepted but its derived plan has not yet
+    /// committed. Persisting this intent lets the next foreground launch retry
+    /// after a save failure or termination instead of stranding old blocks.
+    var planningRebuildPending: Bool = false
     var exportToAppleCalendar: Bool
     /// One-way import: Apple Calendar events become BusyEvents the scheduler avoids.
     var importFromAppleCalendar: Bool = false
@@ -468,17 +498,19 @@ final class UserSettings {
     var eveningReviewMinute: Int = 30
 
     init() {
+        let schedulingDefaults = UserSettingsSchedulingDefaults.fresh
         self.id = UUID()
-        self.wakeHour = 8
-        self.wakeMinute = 0
-        self.sleepHour = 23
-        self.sleepMinute = 0
-        self.minBlockMinutes = 30
-        self.maxBlockMinutes = 90
-        self.deadlineBufferMinutes = 120
-        self.startBufferMinutes = 15
+        self.wakeHour = schedulingDefaults.wakeHour
+        self.wakeMinute = schedulingDefaults.wakeMinute
+        self.sleepHour = schedulingDefaults.sleepHour
+        self.sleepMinute = schedulingDefaults.sleepMinute
+        self.minBlockMinutes = schedulingDefaults.minBlockMinutes
+        self.maxBlockMinutes = schedulingDefaults.maxBlockMinutes
+        self.deadlineBufferMinutes = schedulingDefaults.deadlineBufferMinutes
+        self.startBufferMinutes = schedulingDefaults.startBufferMinutes
         self.dailyFocusMinutes = 0
         self.lastFutileAutomaticRebalanceFingerprint = nil
+        self.planningRebuildPending = false
         self.exportToAppleCalendar = false
         self.importFromAppleCalendar = false
         self.excludedCalendarIds = []
@@ -495,6 +527,20 @@ final class UserSettings {
         self.eveningReviewEnabled = true
         self.eveningReviewHour = 21
         self.eveningReviewMinute = 30
+    }
+
+    /// Restores only the fresh-plan scheduling choices. Notification,
+    /// calendar, and onboarding state remain exactly as the user left them.
+    func applyRecommendedSchedulingDefaults() {
+        let schedulingDefaults = UserSettingsSchedulingDefaults.fresh
+        wakeHour = schedulingDefaults.wakeHour
+        wakeMinute = schedulingDefaults.wakeMinute
+        sleepHour = schedulingDefaults.sleepHour
+        sleepMinute = schedulingDefaults.sleepMinute
+        minBlockMinutes = schedulingDefaults.minBlockMinutes
+        maxBlockMinutes = schedulingDefaults.maxBlockMinutes
+        deadlineBufferMinutes = schedulingDefaults.deadlineBufferMinutes
+        startBufferMinutes = schedulingDefaults.startBufferMinutes
     }
 
     var wakeTime: DateComponents {

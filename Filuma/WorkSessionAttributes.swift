@@ -247,8 +247,20 @@ enum WorkSessionActivityController {
         )
     }
 
-    static func end() {
-        endAll()
+    /// Ends only the timer identity that completed its durable attendance
+    /// boundary. A stale or idle WorkSessionView must not clear a newer task's
+    /// recovery journal or dismiss its Live Activity.
+    static func end(sessionID: UUID) {
+        WorkSessionControlStore.clear(sessionID: sessionID)
+        let activities = Activity<WorkSessionAttributes>.activities.filter {
+            $0.attributes.sessionID == sessionID
+        }
+        guard !activities.isEmpty else { return }
+        Task {
+            for activity in activities {
+                await activity.end(nil, dismissalPolicy: .immediate)
+            }
+        }
     }
 
     static func isActive(sessionID: UUID) -> Bool {

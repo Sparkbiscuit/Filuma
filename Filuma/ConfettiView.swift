@@ -1,222 +1,364 @@
 import SwiftUI
 
-// MARK: - Task Completion celebration
+// MARK: - Task completion ritual
 
+/// Completion is a receipt first and a ritual second. The view never reaches
+/// back into SwiftData, so it cannot celebrate a task that failed to persist or
+/// retain a model that just moved out of an active query.
 struct TaskCompletionView: View {
-    let task: FilumaTask
+    let receipt: TaskCompletionReceipt
     var onDone: () -> Void
-    /// Escape hatch for mis-taps: un-completes the task.
-    var onUndo: (() -> Void)? = nil
+    /// Return an error message to keep the ritual open and explain why the
+    /// durable restore did not happen. `nil` means the parent restored and is
+    /// dismissing this cover.
+    var onUndo: () -> String?
 
-    @State private var badgeScale: CGFloat = 0.4
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @AccessibilityFocusState private var headingFocused: Bool
+
+    @State private var threadProgress: CGFloat = 0
+    @State private var checkIsVisible = false
+    @State private var sealScale: CGFloat = 0.94
+    @State private var successFeedback = 0
+    @State private var didResolve = false
+    @State private var restoreFailureMessage: String?
 
     var body: some View {
-        ZStack {
-            HearthScreenBackground(topGlow: 0.24, bottomGlow: 0.3)
+        GeometryReader { proxy in
+            ScrollView {
+                VStack(spacing: 0) {
+                    Spacer(minLength: dynamicTypeSize.isAccessibilitySize ? 24 : 44)
 
-            ConfettiView(palette: [
-                .schoolColor, .workColor, .personalColor,
-                .brand500, .brand300, .filumaRed
-            ])
-            .ignoresSafeArea()
-            .allowsHitTesting(false)
+                    ThreadTieSeal(
+                        color: receipt.context.color,
+                        progress: threadProgress,
+                        checkIsVisible: checkIsVisible
+                    )
+                    .frame(
+                        width: dynamicTypeSize.isAccessibilitySize ? 116 : 148,
+                        height: dynamicTypeSize.isAccessibilitySize ? 116 : 148
+                    )
+                    .scaleEffect(sealScale)
+                    .padding(.bottom, dynamicTypeSize.isAccessibilitySize ? 20 : 28)
+                    .accessibilityHidden(true)
+
+                    Text("Thread tied")
+                        .font(AppFont.settingsSectionHeader(11))
+                        .tracking(1.4)
+                        .textCase(.uppercase)
+                        .foregroundStyle(receipt.context.displayColor)
+                        .padding(.bottom, 8)
+                        .accessibilityIdentifier("completion.eyebrow")
+
+                    Text("Task complete")
+                        .font(AppFont.title(28))
+                        .foregroundStyle(Color.filumaText)
+                        .multilineTextAlignment(.center)
+                        .accessibilityAddTraits(.isHeader)
+                        .accessibilityIdentifier("completion.title")
+                        .accessibilityFocused($headingFocused)
+                        .padding(.bottom, 8)
+
+                    Text(receipt.title)
+                        .font(AppFont.bodySemibold(16))
+                        .foregroundStyle(Color.filumaSubtle)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 360)
+                        .padding(.bottom, 28)
+
+                    VStack(spacing: 10) {
+                        if receipt.timeSpentMinutes > 0 {
+                            statRow(
+                                icon: "stopwatch",
+                                label: "Time worked",
+                                value: CountdownFormatter.effortString(
+                                    minutes: receipt.timeSpentMinutes
+                                )
+                            )
+                        }
+                        statRow(
+                            icon: "calendar.badge.checkmark",
+                            label: "Finished",
+                            value: receipt.deadlineSummary
+                        )
+                    }
+                    .frame(maxWidth: 420)
+                    .padding(.bottom, 30)
+
+                    Spacer(minLength: 28)
+                }
+                .padding(.horizontal, 28)
+                .frame(maxWidth: .infinity)
+                .frame(minHeight: proxy.size.height)
+            }
+            .scrollIndicators(.hidden)
+        }
+        .background {
+            HearthScreenBackground(topGlow: 0.22, bottomGlow: 0.34, embers: 0)
+                .ignoresSafeArea()
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            actionBar
+        }
+        .sensoryFeedback(.success, trigger: successFeedback)
+        .task(id: receipt.id) {
+            await playRitual()
+        }
+        .alert(
+            "Task still completed",
+            isPresented: Binding(
+                get: { restoreFailureMessage != nil },
+                set: { if !$0 { restoreFailureMessage = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {
+                restoreFailureMessage = nil
+            }
+        } message: {
+            Text(restoreFailureMessage ?? "")
+        }
+    }
+
+    private var actionBar: some View {
+        VStack(spacing: 6) {
+            Button {
+                resolve(onDone)
+            } label: {
+                Text("Done")
+                    .primaryButtonStyle()
+            }
+            .hearthPressStyle(scale: 0.98, pressedOpacity: 0.9)
+            .accessibilityIdentifier("completion.done")
+
+            Button {
+                restore()
+            } label: {
+                Text("Restore task")
+                    .font(AppFont.heading(16))
+                    .foregroundStyle(Color.brand300)
+                    .frame(maxWidth: .infinity, minHeight: 48)
+                    .background(
+                        Color.filumaSurface,
+                        in: RoundedRectangle(
+                            cornerRadius: FilumaRadius.button,
+                            style: .continuous
+                        )
+                    )
+                    .overlay {
+                        RoundedRectangle(
+                            cornerRadius: FilumaRadius.button,
+                            style: .continuous
+                        )
+                        .stroke(Color.filumaBorder, lineWidth: 1)
+                    }
+            }
+            .hearthPressStyle(scale: 0.98, pressedOpacity: 0.88)
+            .accessibilityHint("Returns the remaining work to your current plan")
+            .accessibilityIdentifier("completion.restore")
+        }
+        .frame(maxWidth: 476)
+        .padding(.horizontal, 28)
+        .padding(.top, 12)
+        .padding(.bottom, 8)
+        .frame(maxWidth: .infinity)
+        .background(Color.filumaBackground)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.filumaBorder)
+                .frame(height: 1)
+        }
+    }
+
+    private func resolve(_ action: () -> Void) {
+        guard !didResolve else { return }
+        didResolve = true
+        action()
+    }
+
+    private func restore() {
+        guard !didResolve else { return }
+        didResolve = true
+        if let failure = onUndo() {
+            didResolve = false
+            restoreFailureMessage = failure
+        }
+    }
+
+    @ViewBuilder
+    private func statRow(icon: String, label: String, value: String) -> some View {
+        let iconView = Image(systemName: icon)
+            .font(.system(size: 14, weight: .semibold))
+            .foregroundStyle(receipt.context.displayColor)
+            .frame(width: 22)
             .accessibilityHidden(true)
 
-            VStack(spacing: 0) {
-                Spacer()
-
-                ZStack {
-                    Circle()
-                        .fill(
-                            LinearGradient(
-                                colors: [task.context.displayColor, task.context.color],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                        .frame(width: 72, height: 72)
-                        .hearthGlow(task.context.color, radius: 22, opacity: 0.55)
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 30, weight: .bold))
-                        .foregroundStyle(.white)
-                }
-                .scaleEffect(badgeScale)
-                .padding(.bottom, 20)
-                .accessibilityHidden(true)
-
-                Text("Task Complete!")
-                    .font(AppFont.title(26))
-                    .foregroundStyle(LinearGradient.hearthTitle)
-                    .padding(.bottom, 8)
-                Text(task.title)
-                    .font(AppFont.body(15))
-                    .foregroundStyle(Color.filumaSubtle)
-                    .multilineTextAlignment(.center)
-                    .padding(.bottom, 24)
-
-                VStack(spacing: 10) {
-                    if task.timeSpentMinutes > 0 {
-                        statRow(
-                            icon: "stopwatch",
-                            label: "Time worked",
-                            value: CountdownFormatter.effortString(minutes: task.timeSpentMinutes)
-                        )
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: 5) {
+                    HStack(spacing: 8) {
+                        iconView
+                        Text(label)
+                            .font(AppFont.body(14))
+                            .foregroundStyle(Color.filumaSubtle)
                     }
-                    statRow(
-                        icon: "calendar.badge.checkmark",
-                        label: "Finished",
-                        value: finishedLabel
-                    )
+                    Text(value)
+                        .font(AppFont.mono(13))
+                        .foregroundStyle(Color.filumaText)
                 }
-                .padding(.bottom, 32)
-
-                Button {
-                    onDone()
-                } label: {
-                    Text("Done")
-                        .primaryButtonStyle(fill: task.context.color)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                HStack(spacing: 10) {
+                    iconView
+                    Text(label)
+                        .font(AppFont.body(14))
+                        .foregroundStyle(Color.filumaSubtle)
+                    Spacer()
+                    Text(value)
+                        .font(AppFont.mono(13))
+                        .foregroundStyle(Color.filumaText)
                 }
-
-                if let onUndo {
-                    Button("Undo") {
-                        onUndo()
-                    }
-                    .font(AppFont.caption(14))
-                    .foregroundStyle(Color.filumaSubtle)
-                    .padding(.top, 14)
-                }
-
-                Spacer()
             }
-            .padding(.horizontal, 32)
-        }
-        .onAppear {
-            withAnimation(.spring(response: 0.45, dampingFraction: 0.6)) {
-                badgeScale = 1.0
-            }
-        }
-    }
-
-    private var finishedLabel: String {
-        let remaining = task.deadline.timeIntervalSince(Date())
-        if remaining <= 0 { return "right on the wire" }
-        let hours = Int(remaining) / 3600
-        if hours >= 48 { return "\(hours / 24) days early" }
-        if hours >= 1 { return "\(hours)h to spare" }
-        return "\(max(1, Int(remaining) / 60))m to spare"
-    }
-
-    private func statRow(icon: String, label: String, value: String) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: icon)
-                .font(.system(size: 14))
-                .foregroundStyle(task.context.color)
-                .frame(width: 20)
-                .accessibilityHidden(true)
-            Text(label)
-                .font(AppFont.body(14))
-                .foregroundStyle(Color.filumaSubtle)
-            Spacer()
-            Text(value)
-                .font(AppFont.mono(13))
-                .foregroundStyle(Color.filumaText)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .background(Color.filumaSurface)
         .clipShape(RoundedRectangle(cornerRadius: FilumaRadius.card, style: .continuous))
-        .accessibilityElement(children: .combine)
+        .overlay(
+            RoundedRectangle(cornerRadius: FilumaRadius.card, style: .continuous)
+                .stroke(Color.filumaBorder, lineWidth: 1)
+        )
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(label), \(value)")
+    }
+
+    @MainActor
+    private func playRitual() async {
+        try? await Task.sleep(for: .milliseconds(60))
+        guard !Task.isCancelled else { return }
+        headingFocused = true
+
+        if reduceMotion {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                sealScale = 1
+                threadProgress = 1
+                checkIsVisible = true
+            }
+            successFeedback &+= 1
+            return
+        }
+
+        withAnimation(HearthMotion.reveal) {
+            sealScale = 1
+            threadProgress = 1
+        }
+        try? await Task.sleep(for: .milliseconds(420))
+        guard !Task.isCancelled else { return }
+
+        withAnimation(HearthMotion.selection) {
+            checkIsVisible = true
+        }
+        successFeedback &+= 1
     }
 }
 
-// MARK: - Confetti burst
+// MARK: - Woven seal
 
-/// Lightweight confetti: rectangles and dots fall from the top with slight
-/// horizontal drift and spin. Purely decorative — one shot, no interaction.
-struct ConfettiView: View {
-    let palette: [Color]
-    var pieceCount: Int = 60
+/// A deterministic filament closes around the checkmark, then ties once at
+/// the bottom. Unlike confetti, it has a stable silhouette and a clear resting
+/// state that can become recognizably Filuma's.
+private struct ThreadTieSeal: View {
+    let color: Color
+    let progress: CGFloat
+    let checkIsVisible: Bool
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    private struct Piece {
-        let x: Double          // 0…1 horizontal position
-        let delay: Double
-        let fallDuration: Double
-        let size: Double
-        let colorIndex: Int
-        let isCircle: Bool
-        let spin: Double       // total rotations
-        let drift: Double      // horizontal wobble in points
+    private var ringProgress: CGFloat {
+        min(1, progress / 0.74)
     }
 
-    @State private var pieces: [Piece] = []
-    @State private var startDate = Date()
-    @State private var finished = false
+    private var knotProgress: CGFloat {
+        min(1, max(0, (progress - 0.68) / 0.32))
+    }
 
     var body: some View {
-        Group {
-            if reduceMotion {
-                // A calm, still scatter instead of a continuous fall — the
-                // celebration still reads, nothing keeps moving.
-                Canvas { canvasContext, size in
-                    draw(pieces, elapsed: 1.1, in: canvasContext, size: size)
-                }
-            } else {
-                TimelineView(.animation(minimumInterval: nil, paused: finished)) { timeline in
-                    Canvas { canvasContext, size in
-                        let elapsed = timeline.date.timeIntervalSince(startDate)
-                        draw(pieces, elapsed: elapsed, in: canvasContext, size: size)
-                    }
-                }
-            }
-        }
-        .onAppear {
-            startDate = Date()
-            pieces = (0..<pieceCount).map { index in
-                Piece(
-                    x: .random(in: 0...1),
-                    delay: .random(in: 0...0.6),
-                    fallDuration: .random(in: 2.2...3.6),
-                    size: .random(in: 6...11),
-                    colorIndex: index,
-                    isCircle: Bool.random(),
-                    spin: .random(in: 1...3),
-                    drift: .random(in: 12...36)
+        ZStack {
+            Circle()
+                .fill(Color.filumaSurface)
+                .overlay(Circle().stroke(Color.filumaBorder, lineWidth: 1))
+                .padding(17)
+
+            Circle()
+                .trim(from: 0, to: ringProgress)
+                .stroke(
+                    LinearGradient(
+                        colors: [color.opacity(0.45), color, color.opacity(0.72)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    style: StrokeStyle(lineWidth: 3, lineCap: .round)
                 )
-            }
+                .rotationEffect(.degrees(-90))
+                .padding(10)
+
+            ThreadKnotShape()
+                .trim(from: 0, to: knotProgress)
+                .stroke(
+                    color,
+                    style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round)
+                )
+                .frame(width: 72, height: 38)
+                .offset(y: 46)
+
+            CompletionCheckmarkShape()
+                .trim(from: 0, to: checkIsVisible ? 1 : 0)
+                .stroke(
+                    Color.white,
+                    style: StrokeStyle(lineWidth: 6, lineCap: .round, lineJoin: .round)
+                )
+                .frame(width: 43, height: 32)
         }
-        .task {
-            try? await Task.sleep(for: .seconds(5))
-            finished = true
-        }
+        .hearthGlow(color, radius: 24, opacity: 0.46)
     }
+}
 
-    private func draw(_ pieces: [Piece], elapsed: Double, in context: GraphicsContext, size: CGSize) {
-        for piece in pieces {
-            let t = (elapsed - piece.delay) / piece.fallDuration
-            guard t > 0, t < 1.15 else { continue }
+private struct CompletionCheckmarkShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.minX + 2, y: rect.midY))
+        path.addLine(to: CGPoint(x: rect.minX + rect.width * 0.4, y: rect.maxY - 2))
+        path.addLine(to: CGPoint(x: rect.maxX - 2, y: rect.minY + 2))
+        return path
+    }
+}
 
-            let y = t * (size.height + 80) - 40
-            let x = piece.x * size.width + sin(t * .pi * 3) * piece.drift
-            let angle = Angle(degrees: t * 360 * piece.spin)
-            let opacity = t > 0.9 ? max(0, 1 - (t - 0.9) / 0.25) : 1
-
-            var ctx = context
-            ctx.opacity = opacity
-            ctx.translateBy(x: x, y: y)
-            ctx.rotate(by: angle)
-
-            let color = palette[piece.colorIndex % max(1, palette.count)]
-            let rect = CGRect(
-                x: -piece.size / 2, y: -piece.size / 2,
-                width: piece.size, height: piece.isCircle ? piece.size : piece.size * 0.6
-            )
-            if piece.isCircle {
-                ctx.fill(Path(ellipseIn: rect), with: .color(color))
-            } else {
-                ctx.fill(Path(roundedRect: rect, cornerRadius: 1.5), with: .color(color))
-            }
-        }
+/// The small crossing loop at the base turns a completed ring into a tied
+/// thread rather than another generic success badge.
+private struct ThreadKnotShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: rect.midX, y: rect.minY + 2))
+        path.addCurve(
+            to: CGPoint(x: rect.minX + 5, y: rect.midY),
+            control1: CGPoint(x: rect.midX - 8, y: rect.minY + 7),
+            control2: CGPoint(x: rect.minX + 18, y: rect.minY + 2)
+        )
+        path.addCurve(
+            to: CGPoint(x: rect.midX, y: rect.maxY - 3),
+            control1: CGPoint(x: rect.minX + 3, y: rect.maxY - 4),
+            control2: CGPoint(x: rect.midX - 13, y: rect.maxY - 5)
+        )
+        path.addCurve(
+            to: CGPoint(x: rect.maxX - 5, y: rect.midY),
+            control1: CGPoint(x: rect.midX + 13, y: rect.maxY - 5),
+            control2: CGPoint(x: rect.maxX - 3, y: rect.maxY - 4)
+        )
+        path.addCurve(
+            to: CGPoint(x: rect.midX, y: rect.minY + 2),
+            control1: CGPoint(x: rect.maxX - 18, y: rect.minY + 2),
+            control2: CGPoint(x: rect.midX + 8, y: rect.minY + 7)
+        )
+        return path
     }
 }

@@ -9,20 +9,71 @@ enum BlockPushChoice {
     case tomorrow
 }
 
+private struct TaskListReminderRetry {
+    let reminderID: UUID
+    let mutation: ReminderMutation
+}
+
+private struct TaskListNotice: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
+    let reminderRetry: TaskListReminderRetry?
+
+    init(
+        title: String,
+        message: String,
+        reminderRetry: TaskListReminderRetry? = nil
+    ) {
+        self.title = title
+        self.message = message
+        self.reminderRetry = reminderRetry
+    }
+}
+
+/// A single deterministic snapshot for the complete Focus thread. Keeping the
+/// time argument explicit makes block-boundary behavior testable and prevents
+/// the hero and queue from reading different wall-clock instants.
+enum TaskFocusTimeline {
+    static func blocks(from tasks: [FilumaTask], at now: Date) -> [ScheduledBlock] {
+        tasks
+            .filter { !$0.isComplete }
+            .flatMap(\.scheduledBlocks)
+            .filter {
+                !$0.isComplete
+                    && $0.endTime > now
+                    && $0.task != nil
+            }
+            .sorted { $0.startTime < $1.startTime }
+    }
+}
+
 struct TaskListView: View {
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @ScaledMetric(relativeTo: .body) private var navigationDockClearance: CGFloat = 110
     @Query(sort: \FilumaTask.deadline) private var tasks: [FilumaTask]
     @Query(sort: \Reminder.dueDate) private var reminders: [Reminder]
     @Binding var replanSummary: CatchUpSummary
     @Binding var sessionRequestTaskId: UUID?
-    @State private var showingCapture = false
+    let onRequestCapture: () -> Void
     @State private var expandedContexts: Set<TaskContext> = Set(TaskContext.allCases)
     @State private var workSessionTask: FilumaTask?
-    @State private var celebrationTask: FilumaTask?
+    @State private var completionReceipt: TaskCompletionReceipt?
+    @State private var pendingCompletionReceipt: TaskCompletionReceipt?
     @State private var editingTask: FilumaTask?
     @State private var triageEditTask: FilumaTask?
     @State private var showCompleted = false
     @State private var pushNote: String?
+    @State private var taskNotice: TaskListNotice?
+    @State private var pendingTaskNotice: TaskListNotice?
+
+    /// List insertions, removals, and disclosure geometry are spatial. Keep the
+    /// state change but make it immediate when Reduce Motion is enabled.
+    private var stateAnimation: Animation? {
+        reduceMotion ? nil : HearthMotion.selection
+    }
 
     var body: some View {
         NavigationStack {
@@ -30,56 +81,78 @@ struct TaskListView: View {
                 ScrollView {
                     VStack(spacing: 0) {
                         headerSection
-                        heroSection
-                        upNextThreadSection
                         replanBanner
-                        pushBanner
-                        statsBar
-                        overdueTriageSection
-                        remindersSection
-                        taskSections
-                        completedSection
+                        focusSection
+                        librarySection
                     }
-                    .padding(.bottom, 110)
+                    .padding(.bottom, min(navigationDockClearance, 300))
                     .frame(maxWidth: FilumaLayout.readableContentMaxWidth)
                     .frame(maxWidth: .infinity)
                 }
                 .hearthScreen()
             }
-            .sheet(isPresented: $showingCapture) {
-                CaptureSheetView()
-            }
-            .fullScreenCover(item: $workSessionTask) { task in
-                WorkSessionView(task: task) { completed in
+            .fullScreenCover(
+                item: $workSessionTask,
+                onDismiss: presentPendingCompletion
+            ) { task in
+                WorkSessionView(task: task) { receipt in
+                    pendingCompletionReceipt = receipt
                     workSessionTask = nil
-                    if completed {
-                        // Let the sheet finish dismissing before presenting the
-                        // celebration cover, or SwiftUI drops the presentation.
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                            completeTask(task)
-                        }
-                    }
                 }
             }
-            .fullScreenCover(item: $celebrationTask) { task in
-                TaskCompletionView(task: task) {
-                    celebrationTask = nil
+            .fullScreenCover(
+                item: $completionReceipt,
+                onDismiss: presentPendingTaskStatus
+            ) { receipt in
+                TaskCompletionView(receipt: receipt) {
+                    completionReceipt = nil
                 } onUndo: {
-                    restoreTask(task, context: modelContext)
-                    celebrationTask = nil
+                    let outcome = restoreTask(withID: receipt.taskID)
+                    guard outcome.didRestore else { return outcome.message }
+                    if let message = outcome.message {
+                        pendingTaskNotice = TaskListNotice(
+                            title: "A little more time",
+                            message: message
+                        )
+                    }
+                    completionReceipt = nil
+                    return nil
                 }
             }
             .sheet(item: $editingTask) { task in
                 TaskEditView(task: task)
+                    // SwiftUI presentations can be hosted outside the root
+                    // test environment. Forward the inherited size explicitly
+                    // so the sheet always matches the invoking Tasks screen.
+                    .environment(\.dynamicTypeSize, dynamicTypeSize)
             }
             .sheet(item: $triageEditTask) { task in
                 TaskEditView(task: task, emphasizeDeadline: true)
+                    .environment(\.dynamicTypeSize, dynamicTypeSize)
             }
             .onAppear {
                 consumeSessionRequest()
             }
             .onChange(of: sessionRequestTaskId) { _, _ in
                 consumeSessionRequest()
+            }
+            .alert(item: $taskNotice) { notice in
+                if let retry = notice.reminderRetry {
+                    Alert(
+                        title: Text(notice.title),
+                        message: Text(notice.message),
+                        primaryButton: .default(Text("Try Again")) {
+                            retryReminderMutation(retry)
+                        },
+                        secondaryButton: .cancel(Text("Not Now"))
+                    )
+                } else {
+                    Alert(
+                        title: Text(notice.title),
+                        message: Text(notice.message),
+                        dismissButton: .cancel(Text("OK"))
+                    )
+                }
             }
         }
     }
@@ -120,7 +193,7 @@ struct TaskListView: View {
                 ActiveCountPill(count: activeCount)
             }
         }
-        .padding(.horizontal, 20)
+        .padding(.horizontal, FilumaSpacing.screen)
         .padding(.top, 16)
         .padding(.bottom, 8)
     }
@@ -132,29 +205,102 @@ struct TaskListView: View {
         else { return "Good evening" }
     }
 
+    // MARK: - Screen hierarchy
+
+    /// Populated Tasks has two jobs with intentionally different visual
+    /// weight: Focus removes the next decision; Library keeps everything else
+    /// findable without competing with the current thread.
+    @ViewBuilder
+    private var focusSection: some View {
+        // Hero, continuation, and queue all read the same clock snapshot. A
+        // block boundary therefore advances the whole thread atomically rather
+        // than briefly showing the new hero again under Up Next.
+        TimelineView(.periodic(from: .now, by: 1)) { timeline in
+            let candidates = TaskFocusTimeline.blocks(from: tasks, at: timeline.date)
+
+            if let heroBlock = candidates.first,
+               let heroTask = heroBlock.task {
+                VStack(spacing: 0) {
+                    sectionHeading(
+                        "Focus",
+                        subtitle: "The thread in front of you",
+                        identifier: "tasks.section.focus"
+                    )
+                    heroSection(
+                        task: heroTask,
+                        block: heroBlock,
+                        now: timeline.date,
+                        hasFollowingBlock: candidates.count > 1
+                    )
+                    pushBanner
+                    upNextThreadSection(blocks: Array(candidates.dropFirst().prefix(3)))
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var librarySection: some View {
+        let hasPendingWork = tasks.contains { !$0.isComplete }
+            || reminders.contains { !$0.isComplete }
+
+        if hasPendingWork {
+            sectionHeading(
+                "Library",
+                subtitle: "Every active commitment, grouped by context",
+                identifier: "tasks.section.library"
+            )
+        }
+        statsBar
+        overdueTriageSection
+        remindersSection
+        taskSections
+        completedSection
+    }
+
+    private func sectionHeading(
+        _ title: String,
+        subtitle: String,
+        identifier: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(AppFont.heading(19))
+                .foregroundStyle(Color.filumaText)
+            Text(subtitle)
+                .font(AppFont.body(12))
+                .foregroundStyle(Color.filumaFaint)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, FilumaSpacing.screen)
+        .padding(.top, 10)
+        .padding(.bottom, 10)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
+        .accessibilityIdentifier(identifier)
+    }
+
     // MARK: - Right Now hero
 
     /// The one-glance answer to "what should I be doing this minute?" — the
     /// running block if there is one, else the next upcoming block, with a
     /// single big Start button. Opening the app should never require a decision.
-    private var heroSection: some View {
-        let candidates = currentAndUpcomingBlocks(at: Date())
-
-        // One-second cadence: the hero ring carries a live mm:ss countdown.
-        return TimelineView(.periodic(from: .now, by: 1)) { timeline in
-            if let block = candidates.first(where: { $0.endTime > timeline.date }),
-               let task = block.task {
-                RightNowCard(
-                    task: task,
-                    block: block,
-                    now: timeline.date,
-                    onStart: { workSessionTask = task },
-                    onPush: { choice in push(task: task, choice: choice) }
-                )
-                .padding(.horizontal, 20)
-                .padding(.bottom, 4)
-            }
-        }
+    private func heroSection(
+        task: FilumaTask,
+        block: ScheduledBlock,
+        now: Date,
+        hasFollowingBlock: Bool
+    ) -> some View {
+        RightNowCard(
+            task: task,
+            block: block,
+            now: now,
+            showsThreadContinuation: hasFollowingBlock && pushNote == nil,
+            onStart: { workSessionTask = task },
+            onPush: { choice in push(task: task, choice: choice) }
+        )
+        .padding(.horizontal, FilumaSpacing.screen)
+        .padding(.bottom, 4)
     }
 
     // MARK: - Up next (the glowing thread)
@@ -163,17 +309,8 @@ struct TaskListView: View {
     /// scheduled blocks beyond the hero, each row's context dot breaking
     /// through the thread.
     @ViewBuilder
-    private var upNextThreadSection: some View {
-        let now = Date()
-        let heroBlock = currentOrNextBlock(at: now)
-        let upcoming = tasks
-            .filter { !$0.isComplete }
-            .flatMap(\.scheduledBlocks)
-            .filter { !$0.isComplete && $0.endTime > now && $0.id != heroBlock?.id }
-            .sorted { $0.startTime < $1.startTime }
-            .prefix(3)
-
-        if !upcoming.isEmpty {
+    private func upNextThreadSection(blocks: [ScheduledBlock]) -> some View {
+        if !blocks.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
                 Text("UP NEXT")
                     .font(AppFont.caption(11))
@@ -183,7 +320,7 @@ struct TaskListView: View {
                     .padding(.bottom, 10)
 
                 VStack(spacing: 10) {
-                    ForEach(Array(upcoming)) { block in
+                    ForEach(blocks) { block in
                         if let task = block.task {
                             UpNextThreadRow(task: task, block: block) {
                                 workSessionTask = task
@@ -216,7 +353,7 @@ struct TaskListView: View {
                 .allowsHitTesting(false)
                 .accessibilityHidden(true)
             }
-            .padding(.horizontal, 20)
+            .padding(.horizontal, FilumaSpacing.screen)
             .padding(.top, 14)
             .padding(.bottom, 16)
         }
@@ -226,12 +363,16 @@ struct TaskListView: View {
     @ViewBuilder
     private var pushBanner: some View {
         if let note = pushNote {
-            InfoBanner(icon: "arrow.uturn.forward", text: note)
-                .padding(.horizontal, 20)
+            Button {
+                withAnimation(stateAnimation) { pushNote = nil }
+            } label: {
+                InfoBanner(icon: "arrow.uturn.forward", text: note)
+                    .frame(maxWidth: .infinity, minHeight: 44)
+                    .contentShape(Rectangle())
+            }
+                .buttonStyle(.plain)
+                .padding(.horizontal, FilumaSpacing.screen)
                 .padding(.bottom, 16)
-                .onTapGesture {
-                    withAnimation { pushNote = nil }
-                }
                 .accessibilityAddTraits(.isButton)
                 .accessibilityHint("Dismisses this message")
         }
@@ -241,7 +382,6 @@ struct TaskListView: View {
     /// The whole task replans from the chosen start, so the deadline math
     /// stays honest instead of one orphaned block landing somewhere random.
     private func push(task: FilumaTask, choice: BlockPushChoice) {
-        let settings = UserSettings.fetchOrCreate(in: modelContext)
         let calendar = Calendar.current
 
         let start: Date
@@ -251,23 +391,47 @@ struct TaskListView: View {
         case .oneHour:
             start = Date().addingTimeInterval(3600)
         case .tomorrow:
+            let existingSettings: UserSettings?
+            do {
+                existingSettings = try modelContext
+                    .fetch(FetchDescriptor<UserSettings>())
+                    .first
+            } catch {
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+                taskNotice = TaskListNotice(
+                    title: "Plan not moved",
+                    message: "Filuma couldn’t read your planning day yet. Your existing plan is unchanged—try again."
+                )
+                return
+            }
+            let defaults = UserSettingsSchedulingDefaults.fresh
             let tomorrow = calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: Date()))
             start = tomorrow.flatMap {
                 calendar.date(
-                    bySettingHour: settings.wakeHour,
-                    minute: settings.wakeMinute,
+                    bySettingHour: existingSettings?.wakeHour ?? defaults.wakeHour,
+                    minute: existingSettings?.wakeMinute ?? defaults.wakeMinute,
                     second: 0, of: $0
                 )
             } ?? Date().addingTimeInterval(24 * 3600)
         }
 
-        let result = PlanCoordinator.rescheduleTask(
-            task,
-            context: modelContext,
-            from: start
-        )
+        let result: ScheduleResult
+        do {
+            result = try PlanCoordinator.rescheduleTask(
+                task,
+                context: modelContext,
+                from: start
+            )
+        } catch {
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            taskNotice = TaskListNotice(
+                title: "Plan not moved",
+                message: "Filuma couldn’t move this task yet. Your existing plan is unchanged—try again."
+            )
+            return
+        }
 
-        withAnimation {
+        withAnimation(stateAnimation) {
             switch result {
             case .success(let blocks):
                 if let next = blocks.min(by: { $0.startTime < $1.startTime }) {
@@ -291,22 +455,6 @@ struct TaskListView: View {
         let formatter = DateFormatter()
         formatter.dateFormat = "EEEE"
         return "\(formatter.string(from: date)) at \(time)"
-    }
-
-    private func currentOrNextBlock(at now: Date) -> ScheduledBlock? {
-        tasks
-            .filter { !$0.isComplete }
-            .flatMap(\.scheduledBlocks)
-            .filter { !$0.isComplete && $0.endTime > now }
-            .min { $0.startTime < $1.startTime }
-    }
-
-    private func currentAndUpcomingBlocks(at now: Date) -> [ScheduledBlock] {
-        tasks
-            .filter { !$0.isComplete }
-            .flatMap(\.scheduledBlocks)
-            .filter { !$0.isComplete && $0.endTime > now }
-            .sorted { $0.startTime < $1.startTime }
     }
 
     // MARK: - Overdue triage
@@ -347,7 +495,7 @@ struct TaskListView: View {
                     )
                 }
             }
-            .padding(.horizontal, 20)
+            .padding(.horizontal, FilumaSpacing.screen)
             .padding(.bottom, 16)
         }
     }
@@ -360,32 +508,47 @@ struct TaskListView: View {
 
     /// Deliberately dropping a task is a decision, not a failure.
     private func letGo(_ task: FilumaTask) {
-        withAnimation {
-            deleteTask(task, context: modelContext)
+        do {
+            try PlanCoordinator.deleteTask(task, context: modelContext)
+        } catch {
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            taskNotice = TaskListNotice(
+                title: "Task not removed",
+                message: "Filuma couldn’t remove that task yet. It is still safely in your plan—try again."
+            )
         }
-        PlanCoordinator.publishChange(context: modelContext)
     }
 
     // MARK: - Stats Bar
 
+    @ViewBuilder
     private var statsBar: some View {
         let incomplete = tasks.filter { !$0.isComplete }
         let unscheduled = incomplete.filter { !$0.isFullyScheduled }
         let todayBlocks = todayBlockCount
 
-        return VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 10) {
-                StatPill(value: "\(incomplete.count)", label: "active", color: .filumaText)
-                StatPill(value: "\(todayBlocks)", label: "today", color: .schoolColor)
-                if !unscheduled.isEmpty {
-                    StatPill(value: "\(unscheduled.count)", label: "unblocked", color: .filumaRed)
+        if !incomplete.isEmpty {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 10) {
+                    StatPill(
+                        value: "\(todayBlocks)",
+                        label: todayBlocks == 1 ? "block today" : "blocks today",
+                        color: .schoolColor
+                    )
+                    if !unscheduled.isEmpty {
+                        StatPill(
+                            value: "\(unscheduled.count)",
+                            label: unscheduled.count == 1 ? "needs time" : "need time",
+                            color: .filumaRed
+                        )
+                    }
+                    Spacer()
                 }
-                Spacer()
+                paceSummary
             }
-            paceSummary
+            .padding(.horizontal, FilumaSpacing.screen)
+            .padding(.bottom, 16)
         }
-        .padding(.horizontal, 20)
-        .padding(.bottom, 16)
     }
 
     /// One honest sentence about the most-pressured task — the early warning
@@ -434,27 +597,30 @@ struct TaskListView: View {
     @ViewBuilder
     private var replanBanner: some View {
         if replanSummary.adjustedTasks > 0 {
-            VStack(spacing: 10) {
-                InfoBanner(
-                    icon: "arrow.triangle.2.circlepath",
-                    text: replanSummary.feedbackMessage
-                )
-                if let warningMessage = replanSummary.warningMessage {
+            Button {
+                withAnimation(stateAnimation) { replanSummary = CatchUpSummary() }
+            } label: {
+                VStack(spacing: 10) {
                     InfoBanner(
-                        icon: "exclamationmark.triangle.fill",
-                        text: warningMessage,
-                        tint: .filumaRed
+                        icon: "arrow.triangle.2.circlepath",
+                        text: replanSummary.feedbackMessage
                     )
+                    if let warningMessage = replanSummary.warningMessage {
+                        InfoBanner(
+                            icon: "exclamationmark.triangle.fill",
+                            text: warningMessage,
+                            tint: .filumaRed
+                        )
+                    }
                 }
+                .frame(maxWidth: .infinity, minHeight: 44)
+                .contentShape(Rectangle())
             }
-            .padding(.horizontal, 20)
+            .buttonStyle(.plain)
+            .padding(.horizontal, FilumaSpacing.screen)
             .padding(.bottom, 16)
-            .onTapGesture {
-                withAnimation { replanSummary = CatchUpSummary() }
-            }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(replanSummary.accessibilityAnnouncement)
-            .accessibilityAddTraits(.isButton)
             .accessibilityHint("Dismisses this message")
         }
     }
@@ -480,7 +646,7 @@ struct TaskListView: View {
                     Spacer()
                 }
                 .accessibilityElement(children: .combine)
-                .padding(.horizontal, 20)
+                .padding(.horizontal, FilumaSpacing.screen)
                 .padding(.vertical, 12)
 
                 VStack(spacing: 10) {
@@ -490,7 +656,7 @@ struct TaskListView: View {
                         } onDelete: {
                             deleteReminder(reminder)
                         }
-                        .padding(.horizontal, 20)
+                        .padding(.horizontal, FilumaSpacing.screen)
                     }
                 }
                 .padding(.bottom, 16)
@@ -499,19 +665,11 @@ struct TaskListView: View {
     }
 
     private func completeReminder(_ reminder: Reminder) {
-        withAnimation {
-            reminder.isComplete = true
-        }
-        NotificationService.cancel(reminder)
-        SharedStore.reloadWidgets()
+        applyReminderMutation(.complete, to: reminder)
     }
 
     private func deleteReminder(_ reminder: Reminder) {
-        NotificationService.cancel(reminder)
-        withAnimation {
-            modelContext.delete(reminder)
-        }
-        SharedStore.reloadWidgets()
+        applyReminderMutation(.delete, to: reminder)
     }
 
     // MARK: - Task Sections (grouped by context)
@@ -530,14 +688,23 @@ struct TaskListView: View {
         }
 
         if allIncomplete.isEmpty {
-            EmptyStateView(
-                icon: "tray",
-                title: "All clear",
-                subtitle: "Tap + to add your next task.",
-                actionLabel: "Add a task",
-                action: { showingCapture = true }
-            )
-            .padding(.top, 40)
+            if tasks.isEmpty && reminders.isEmpty {
+                FirstTaskEmptyState {
+                    onRequestCapture()
+                }
+            } else {
+                let hasPendingReminders = reminders.contains { !$0.isComplete }
+                EmptyStateView(
+                    icon: hasPendingReminders ? "calendar.badge.clock" : "checkmark",
+                    title: hasPendingReminders ? "No tasks waiting" : "All clear",
+                    subtitle: hasPendingReminders
+                        ? "Your reminders are above. Add a task when it needs time on your schedule."
+                        : "Nothing needs your attention right now.",
+                    actionLabel: "Add a task",
+                    action: onRequestCapture
+                )
+                .padding(.top, 24)
+            }
         } else {
             ForEach(TaskContext.allCases) { context in
                 let contextTasks = sorted.filter { $0.context == context }
@@ -551,9 +718,9 @@ struct TaskListView: View {
     private func contextSection(context: TaskContext, tasks: [FilumaTask]) -> some View {
         let isExpanded = expandedContexts.contains(context)
 
-        return VStack(spacing: 0) {
+        return VStack(alignment: .leading, spacing: 8) {
             Button {
-                withAnimation(.easeInOut(duration: 0.25)) {
+                withAnimation(stateAnimation) {
                     if isExpanded {
                         expandedContexts.remove(context)
                     } else {
@@ -579,27 +746,46 @@ struct TaskListView: View {
                         .rotationEffect(.degrees(isExpanded ? 90 : 0))
                         .accessibilityHidden(true)
                 }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 12)
+                .padding(.horizontal, 4)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("\(context.rawValue), \(tasks.count) tasks")
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .accessibilityLabel(
+                "\(context.rawValue), \(tasks.count) \(tasks.count == 1 ? "task" : "tasks")"
+            )
             .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
+            .accessibilityHint(isExpanded ? "Collapses this task group" : "Expands this task group")
+            .accessibilityIdentifier("tasks.context.\(context.rawValue.lowercased())")
 
             CollapsibleSectionBody(isExpanded: isExpanded) {
-                VStack(spacing: 10) {
-                    ForEach(tasks) { task in
+                VStack(spacing: 0) {
+                    ForEach(Array(tasks.enumerated()), id: \.element.id) { index, task in
+                        if index > 0 {
+                            Divider()
+                                .overlay(Color.filumaBorder)
+                                .padding(.leading, 16)
+                        }
                         TaskRowView(
                             task: task,
                             onStartSession: { workSessionTask = task },
                             onComplete: { completeTask(task) },
                             onEdit: { editingTask = task }
                         )
-                        .padding(.horizontal, 20)
                     }
+                }
+                .background(Color.filumaSurface)
+                .clipShape(
+                    RoundedRectangle(cornerRadius: FilumaRadius.group, style: .continuous)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: FilumaRadius.group, style: .continuous)
+                        .stroke(Color.filumaBorder, lineWidth: 1)
                 }
             }
         }
+        .padding(.horizontal, FilumaSpacing.screen)
     }
 
     // MARK: - Completed section
@@ -611,7 +797,7 @@ struct TaskListView: View {
         if !completed.isEmpty || !completedReminders.isEmpty {
             VStack(spacing: 0) {
                 Button {
-                    withAnimation(.easeInOut(duration: 0.25)) {
+                    withAnimation(stateAnimation) {
                         showCompleted.toggle()
                     }
                 } label: {
@@ -633,8 +819,9 @@ struct TaskListView: View {
                             .rotationEffect(.degrees(showCompleted ? 90 : 0))
                             .accessibilityHidden(true)
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.vertical, 12)
+                    .padding(.horizontal, FilumaSpacing.screen)
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel("Completed, \(completed.count + completedReminders.count) items")
@@ -646,26 +833,34 @@ struct TaskListView: View {
                             ($0.completedAt ?? $0.deadline) > ($1.completedAt ?? $1.deadline)
                         }) { task in
                             CompletedTaskRow(task: task) {
-                                withAnimation {
-                                    restoreTask(task, context: modelContext)
+                                withAnimation(stateAnimation) {
+                                    if let message = restoreTask(task).message {
+                                        taskNotice = TaskListNotice(
+                                            title: "A little more time",
+                                            message: message
+                                        )
+                                    }
                                 }
                             } onDelete: {
-                                withAnimation {
-                                    deleteTask(task, context: modelContext)
+                                do {
+                                    try PlanCoordinator.deleteTask(task, context: modelContext)
+                                } catch {
+                                    UINotificationFeedbackGenerator().notificationOccurred(.error)
+                                    taskNotice = TaskListNotice(
+                                        title: "Task not removed",
+                                        message: "Filuma couldn’t remove that task yet. It is still in Completed—try again."
+                                    )
                                 }
-                                PlanCoordinator.publishChange(context: modelContext)
                             }
-                            .padding(.horizontal, 20)
+                            .padding(.horizontal, FilumaSpacing.screen)
                         }
                         ForEach(completedReminders.sorted { $0.dueDate > $1.dueDate }) { reminder in
                             CompletedReminderRow(reminder: reminder) {
                                 restoreReminder(reminder)
                             } onDelete: {
-                                withAnimation {
-                                    modelContext.delete(reminder)
-                                }
+                                deleteReminder(reminder)
                             }
-                            .padding(.horizontal, 20)
+                            .padding(.horizontal, FilumaSpacing.screen)
                         }
                     }
                 }
@@ -674,26 +869,246 @@ struct TaskListView: View {
     }
 
     private func restoreReminder(_ reminder: Reminder) {
-        withAnimation {
-            reminder.isComplete = false
+        applyReminderMutation(.restore, to: reminder)
+    }
+
+    private func applyReminderMutation(
+        _ mutation: ReminderMutation,
+        to reminder: Reminder
+    ) {
+        do {
+            _ = try withAnimation(stateAnimation) {
+                try ReminderMutationCoordinator.apply(
+                    mutation,
+                    to: reminder,
+                    context: modelContext
+                )
+            }
+            taskNotice = nil
+        } catch {
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            taskNotice = reminderFailureNotice(
+                mutation: mutation,
+                reminderID: reminder.id
+            )
         }
-        // Re-arm the alert if it hasn't fired yet; a past-due restore just
-        // returns to the pending list.
-        if reminder.dueDate > Date() {
-            NotificationService.schedule(for: reminder)
+    }
+
+    private func retryReminderMutation(_ retry: TaskListReminderRetry) {
+        if let heldReminder = reminders.first(where: { $0.id == retry.reminderID }) {
+            applyReminderMutation(retry.mutation, to: heldReminder)
+            return
         }
-        SharedStore.reloadWidgets()
+
+        let fetched: [Reminder]
+        do {
+            fetched = try modelContext.fetch(FetchDescriptor<Reminder>())
+        } catch {
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            taskNotice = TaskListNotice(
+                title: "Reminder not reloaded",
+                message: "Filuma couldn’t reload that reminder yet. Nothing else was changed.",
+                reminderRetry: retry
+            )
+            return
+        }
+
+        let reminder = fetched.first { $0.id == retry.reminderID }
+        guard let reminder else {
+            taskNotice = TaskListNotice(
+                title: "Reminder unavailable",
+                message: "That reminder is no longer available to change."
+            )
+            return
+        }
+        applyReminderMutation(retry.mutation, to: reminder)
+    }
+
+    private func reminderFailureNotice(
+        mutation: ReminderMutation,
+        reminderID: UUID
+    ) -> TaskListNotice {
+        let retry = TaskListReminderRetry(
+            reminderID: reminderID,
+            mutation: mutation
+        )
+        switch mutation {
+        case .complete:
+            return TaskListNotice(
+                title: "Reminder not completed",
+                message: "Filuma couldn’t save that completion yet, so the reminder is still active.",
+                reminderRetry: retry
+            )
+        case .restore:
+            return TaskListNotice(
+                title: "Reminder not restored",
+                message: "Filuma couldn’t save that restore yet, so the reminder is still completed.",
+                reminderRetry: retry
+            )
+        case .delete:
+            return TaskListNotice(
+                title: "Reminder not removed",
+                message: "Filuma couldn’t remove that reminder yet, so it is still safely in your list.",
+                reminderRetry: retry
+            )
+        }
     }
 
     // MARK: - Completion
 
     private func completeTask(_ task: FilumaTask) {
-        withAnimation {
-            PlanCoordinator.completeTask(task, context: modelContext)
+        do {
+            completionReceipt = try PlanCoordinator.completeTask(
+                task,
+                context: modelContext
+            )
+        } catch {
+            taskNotice = TaskListNotice(
+                title: "Completion not saved yet",
+                message: "Filuma couldn’t save that completion yet, so the task is still active. Please try again."
+            )
         }
-        celebrationTask = task
     }
 
+    private func presentPendingCompletion() {
+        guard let receipt = pendingCompletionReceipt else { return }
+        pendingCompletionReceipt = nil
+        // Move to the next presentation transaction after the work-session
+        // cover has fully left the hierarchy.
+        Task { @MainActor in
+            await Task.yield()
+            completionReceipt = receipt
+        }
+    }
+
+    private struct RestoreOutcome {
+        let didRestore: Bool
+        let message: String?
+    }
+
+    private func restoreTask(withID taskID: UUID) -> RestoreOutcome {
+        guard let task = tasks.first(where: { $0.id == taskID }) else {
+            return RestoreOutcome(
+                didRestore: false,
+                message: "That task is no longer available to restore."
+            )
+        }
+        return restoreTask(task)
+    }
+
+    private func restoreTask(_ task: FilumaTask) -> RestoreOutcome {
+        do {
+            let result = try PlanCoordinator.restoreTask(
+                task,
+                context: modelContext,
+                interactive: false
+            )
+            switch result {
+            case .success:
+                return RestoreOutcome(didRestore: true, message: nil)
+            case .partialFit(_, let unscheduledMinutes):
+                let time = CountdownFormatter.effortString(minutes: unscheduledMinutes)
+                return RestoreOutcome(
+                    didRestore: true,
+                    message: "The task is active again. \(time) still couldn’t fit before its deadline, so it will stay visibly unblocked."
+                )
+            case .noSlots:
+                return RestoreOutcome(
+                    didRestore: true,
+                    message: "The task is active again, but no open time remains before its deadline. It will stay visibly unblocked."
+                )
+            }
+        } catch {
+            return RestoreOutcome(
+                didRestore: false,
+                message: "Filuma couldn’t save that restore, so the task is still completed. Please try again."
+            )
+        }
+    }
+
+    private func presentPendingTaskStatus() {
+        guard let notice = pendingTaskNotice else { return }
+        pendingTaskNotice = nil
+        Task { @MainActor in
+            await Task.yield()
+            taskNotice = notice
+        }
+    }
+
+}
+
+// MARK: - First task
+
+/// A first-run promise, not an earned-empty celebration. The three held nodes
+/// show Filuma's whole loop without inventing schedule data: capture a task,
+/// let the calendar hold it, then begin when the time arrives.
+private struct FirstTaskEmptyState: View {
+    var onAdd: () -> Void
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @SceneStorage("tasks.firstThreadDidReveal") private var didReveal = false
+    @State private var isRevealed = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if !dynamicTypeSize.isAccessibilitySize {
+                HearthThreadJourney(
+                    isRevealed: isRevealed,
+                    reduceMotion: reduceMotion
+                )
+                .frame(maxWidth: 340)
+                .padding(.bottom, 22)
+            }
+
+            VStack(spacing: 10) {
+                Text("Start with one task")
+                    .font(AppFont.title(24))
+                    .foregroundStyle(Color.filumaText)
+                    .accessibilityIdentifier("tasks.empty.firstTitle")
+
+                Text("Add a deadline and a rough effort estimate. Filuma plans the work for you.")
+                    .font(AppFont.body(15))
+                    .foregroundStyle(Color.filumaSubtle)
+                    .multilineTextAlignment(.center)
+                    .lineSpacing(2)
+                    .frame(maxWidth: 330)
+            }
+
+            Button(action: onAdd) {
+                HStack(spacing: 8) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 16, weight: .bold))
+                        .accessibilityHidden(true)
+                    Text(dynamicTypeSize.isAccessibilitySize ? "Add a task" : "Add your first task")
+                        .multilineTextAlignment(.center)
+                }
+                .primaryButtonStyle()
+            }
+            .hearthPressStyle(scale: 0.98, pressedOpacity: 0.9)
+            .accessibilityIdentifier("tasks.empty.addFirst")
+            .frame(maxWidth: 360)
+            .padding(.top, 24)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 24)
+        .padding(.top, dynamicTypeSize.isAccessibilitySize ? 12 : 24)
+        .padding(.bottom, 52)
+        .onAppear(perform: revealIfNeeded)
+    }
+
+    private func revealIfNeeded() {
+        if reduceMotion || didReveal {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                isRevealed = true
+            }
+        } else {
+            isRevealed = true
+            didReveal = true
+        }
+    }
 }
 
 // MARK: - Collapsible section body
@@ -706,12 +1121,18 @@ private struct CollapsibleSectionBody<Content: View>: View {
     let isExpanded: Bool
     @ViewBuilder var content: Content
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
         VStack(spacing: 0) {
             if isExpanded {
                 content
                     .padding(.bottom, 16)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .transition(
+                        reduceMotion
+                            ? .opacity
+                            : .opacity.combined(with: .move(edge: .top))
+                    )
             }
         }
         .clipped()
@@ -799,25 +1220,28 @@ private struct UpNextThreadRow: View {
     var onStart: () -> Void
     var onEdit: () -> Void
 
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     var body: some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(task.title)
-                    .font(AppFont.cardTitle(14))
-                    .foregroundStyle(Color.filumaText)
-                    .lineLimit(1)
-                Text(metaLine)
-                    .font(AppFont.caption(11))
-                    .foregroundStyle(isUrgent ? Color.filumaRed : Color.filumaSubtle)
-                    .lineLimit(1)
+        Button(action: onEdit) {
+            Group {
+                if dynamicTypeSize.isAccessibilitySize {
+                    VStack(alignment: .leading, spacing: 7) {
+                        taskCopy
+                        startTime
+                    }
+                } else {
+                    HStack(spacing: 10) {
+                        taskCopy
+                        Spacer(minLength: 8)
+                        startTime
+                    }
+                }
             }
-
-            Spacer(minLength: 8)
-
-            Text(TimeFormatter.clock.string(from: block.startTime))
-                .font(AppFont.mono(12))
-                .foregroundStyle(task.context.displayColor)
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .padding(.horizontal, 14)
         .padding(.vertical, 13)
         .background(Color.filumaSurface)
@@ -834,10 +1258,9 @@ private struct UpNextThreadRow: View {
                 .hearthGlow(task.context.color, radius: 7, opacity: 0.8)
                 .offset(x: -18)
         }
-        .contentShape(RoundedRectangle(cornerRadius: FilumaRadius.row, style: .continuous))
-        .onTapGesture(perform: onEdit)
         .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(.isButton)
+        .accessibilityHint("Opens task details")
+        .accessibilityAction(named: "Start session", onStart)
         .contextMenu {
             Button(action: onStart) {
                 Label("Start Session", systemImage: "play.fill")
@@ -846,6 +1269,25 @@ private struct UpNextThreadRow: View {
                 Label("Edit", systemImage: "pencil")
             }
         }
+    }
+
+    private var taskCopy: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(task.title)
+                .font(AppFont.cardTitle(14))
+                .foregroundStyle(Color.filumaText)
+                .lineLimit(2)
+            Text(metaLine)
+                .font(AppFont.caption(11))
+                .foregroundStyle(isUrgent ? Color.filumaRed : Color.filumaSubtle)
+                .lineLimit(2)
+        }
+    }
+
+    private var startTime: some View {
+        Text(TimeFormatter.clock.string(from: block.startTime))
+            .font(AppFont.mono(12))
+            .foregroundStyle(task.context.displayColor)
     }
 
     private var isUrgent: Bool {
@@ -873,10 +1315,12 @@ private struct RightNowCard: View {
     let task: FilumaTask
     let block: ScheduledBlock
     let now: Date
+    let showsThreadContinuation: Bool
     var onStart: () -> Void
     var onPush: (BlockPushChoice) -> Void
 
     @State private var showPushOptions = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var isActive: Bool { block.startTime <= now }
 
@@ -891,7 +1335,7 @@ private struct RightNowCard: View {
                         Text(ringCountdown)
                             .font(AppFont.mono(15))
                             .foregroundStyle(Color.filumaText)
-                            .contentTransition(.numericText())
+                            .contentTransition(reduceMotion ? .opacity : .numericText())
                             .lineLimit(1)
                             .minimumScaleFactor(0.5)
                         Text(isActive ? "LEFT" : "UNTIL")
@@ -909,7 +1353,7 @@ private struct RightNowCard: View {
                 .accessibilityValue(ringCountdown)
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(isActive ? "RIGHT NOW" : "UP NEXT")
+                    Text(isActive ? "RIGHT NOW" : "NEXT BLOCK")
                         .font(AppFont.caption(11))
                         .foregroundStyle(Color.brand300)
                         .kerning(1.4)
@@ -941,6 +1385,7 @@ private struct RightNowCard: View {
                 }
                 .primaryButtonStyle()
             }
+            .hearthPressStyle(scale: 0.98, pressedOpacity: 0.9)
 
             Button {
                 showPushOptions = true
@@ -948,9 +1393,9 @@ private struct RightNowCard: View {
                 Text("Can't right now?")
                     .font(AppFont.caption(12))
                     .foregroundStyle(Color.filumaSubtle)
-                    .frame(maxWidth: .infinity)
+                    .frame(maxWidth: .infinity, minHeight: 44)
             }
-            .buttonStyle(.plain)
+            .hearthPressStyle(scale: 0.98, pressedOpacity: 0.78)
         }
         .padding(18)
         // A soft ember pooled in the top-right corner (applied before the
@@ -974,7 +1419,7 @@ private struct RightNowCard: View {
             LinearGradient(
                 stops: [
                     .init(color: Color.brand500.opacity(0.22), location: 0),
-                    .init(color: Color(hex: 0x1A1A1E), location: 0.58)
+                    .init(color: Color.filumaSurface, location: 0.58)
                 ],
                 startPoint: .topLeading,
                 endPoint: .bottomTrailing
@@ -989,24 +1434,26 @@ private struct RightNowCard: View {
         // down the left edge, around the corner, along the bottom — and the
         // Up Next thread below picks it up. "Now → next" is one thread.
         .overlay(alignment: .bottomLeading) {
-            ThreadConnector()
-                .stroke(
-                    LinearGradient(
-                        stops: [
-                            .init(color: Color.brand300.opacity(0), location: 0),
-                            .init(color: Color.brand300.opacity(0.95), location: 0.45),
-                            .init(color: Color.brand300.opacity(0), location: 1)
-                        ],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    style: StrokeStyle(lineWidth: 2, lineCap: .round)
-                )
-                .frame(width: 90, height: 78)
-                .offset(x: -0.5, y: 1.5)
-                .shadow(color: Color.brand500.opacity(0.6), radius: 6)
-                .allowsHitTesting(false)
-                .accessibilityHidden(true)
+            if showsThreadContinuation {
+                ThreadConnector()
+                    .stroke(
+                        LinearGradient(
+                            stops: [
+                                .init(color: Color.brand300.opacity(0), location: 0),
+                                .init(color: Color.brand300.opacity(0.95), location: 0.45),
+                                .init(color: Color.brand300.opacity(0), location: 1)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        ),
+                        style: StrokeStyle(lineWidth: 2, lineCap: .round)
+                    )
+                    .frame(width: 90, height: 78)
+                    .offset(x: -0.5, y: 1.5)
+                    .shadow(color: Color.brand500.opacity(0.6), radius: 6)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
         }
         .shadow(color: Color.brand500.opacity(0.22), radius: 30, y: 12)
         .confirmationDialog("Can't right now?", isPresented: $showPushOptions, titleVisibility: .visible) {
@@ -1069,6 +1516,7 @@ private struct OverdueTriageRow: View {
     var onLetGo: () -> Void
 
     @State private var confirmLetGo = false
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -1090,25 +1538,15 @@ private struct OverdueTriageRow: View {
             }
             .accessibilityElement(children: .combine)
 
-            HStack(spacing: 8) {
-                TriageButton(
-                    label: "New deadline",
-                    icon: "calendar.badge.clock",
-                    tint: .brand500,
-                    action: onNewDeadline
-                )
-                TriageButton(
-                    label: "Done actually",
-                    icon: "checkmark.circle",
-                    tint: .personalColor,
-                    action: onComplete
-                )
-                TriageButton(
-                    label: "Let it go",
-                    icon: "wind",
-                    tint: .filumaSubtle
-                ) {
-                    confirmLetGo = true
+            Group {
+                if dynamicTypeSize.isAccessibilitySize {
+                    VStack(spacing: 8) {
+                        triageActions
+                    }
+                } else {
+                    HStack(spacing: 8) {
+                        triageActions
+                    }
                 }
             }
         }
@@ -1124,6 +1562,32 @@ private struct OverdueTriageRow: View {
             Button("Keep it", role: .cancel) {}
         } message: {
             Text("\"\(task.title)\" disappears from your list. Dropping a task on purpose is a decision, not a failure.")
+        }
+    }
+
+    @ViewBuilder
+    private var triageActions: some View {
+        TriageButton(
+            label: "New deadline",
+            icon: "calendar.badge.clock",
+            tint: .brand500,
+            identifier: "tasks.triage.newDeadline",
+            action: onNewDeadline
+        )
+        TriageButton(
+            label: "Done actually",
+            icon: "checkmark.circle",
+            tint: .personalColor,
+            identifier: "tasks.triage.complete",
+            action: onComplete
+        )
+        TriageButton(
+            label: "Let it go",
+            icon: "wind",
+            tint: .filumaSubtle,
+            identifier: "tasks.triage.letGo"
+        ) {
+            confirmLetGo = true
         }
     }
 
@@ -1144,6 +1608,7 @@ private struct TriageButton: View {
     let label: String
     let icon: String
     let tint: Color
+    let identifier: String
     let action: () -> Void
 
     var body: some View {
@@ -1157,14 +1622,16 @@ private struct TriageButton: View {
                     .minimumScaleFactor(0.8)
             }
             .foregroundStyle(tint)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 9)
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .padding(.horizontal, 6)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(tint.opacity(0.12))
             )
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityIdentifier(identifier)
     }
 }
 
@@ -1202,9 +1669,10 @@ private struct ReminderRow: View {
                 Image(systemName: "circle")
                     .font(.system(size: 20, weight: .light))
                     .foregroundStyle(Color.filumaFaint)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .contentShape(Rectangle().inset(by: -12))
             .accessibilityLabel("Mark reminder complete")
         }
         .padding(.horizontal, 16)
@@ -1287,9 +1755,10 @@ private struct CompletedTaskRow: View {
                 Image(systemName: "arrow.uturn.backward.circle")
                     .font(.system(size: 20, weight: .light))
                     .foregroundStyle(Color.filumaSubtle)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .contentShape(Rectangle().inset(by: -12))
             .accessibilityLabel("Restore task")
         }
         .padding(.horizontal, 16)
@@ -1349,9 +1818,10 @@ private struct CompletedReminderRow: View {
                 Image(systemName: "arrow.uturn.backward.circle")
                     .font(.system(size: 20, weight: .light))
                     .foregroundStyle(Color.filumaSubtle)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .contentShape(Rectangle().inset(by: -12))
             .accessibilityLabel("Restore reminder")
         }
         .padding(.horizontal, 16)
@@ -1388,41 +1858,4 @@ private struct CompletedReminderRow: View {
         formatter.dateFormat = "MMM d"
         return "\(formatter.string(from: reminder.dueDate)), \(time)"
     }
-}
-
-// MARK: - Delete
-
-/// Delete a task and everything hanging off it, explicitly. The cascade rule
-/// on `FilumaTask.scheduledBlocks`/`workSessions` should handle this, but
-/// SwiftData cascades have a history of leaving children behind with a nil
-/// task — those are the "Unknown Task" ghost blocks on the Schedule. Deleting
-/// the children first and saving immediately closes that hole.
-@MainActor
-func deleteTask(_ task: FilumaTask, context: ModelContext) {
-    for block in task.scheduledBlocks {
-        context.delete(block)
-    }
-    for session in task.workSessions {
-        context.delete(session)
-    }
-    context.delete(task)
-    try? context.save()
-}
-
-// MARK: - Restore
-
-/// Bring a completed task back: un-complete it and put its remaining effort
-/// back on the schedule.
-@MainActor
-func restoreTask(_ task: FilumaTask, context: ModelContext) {
-    task.isComplete = false
-    task.completedAt = nil
-    // A task completed from a 100% progress report has nothing left to
-    // schedule; nudge it back so the schedule reopens and progress stays
-    // adjustable.
-    if task.manualProgressPercent >= 100 {
-        task.manualProgressPercent = 90
-    }
-
-    PlanCoordinator.reconcileTaskAfterProgress(task, context: context)
 }

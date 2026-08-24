@@ -216,6 +216,7 @@ struct SchedulerService {
         busyEvents: [BusyEvent] = [],
         settings: UserSettings,
         from startDate: Date? = nil,
+        now: Date = Date(),
         context: ModelContext
     ) -> ScheduleResult {
         // Remove unlocked, incomplete blocks for this task
@@ -230,7 +231,7 @@ struct SchedulerService {
         let remainingBlocks = allBlocks.filter { !removedIds.contains($0.id) }
         let planningStart = roundUpToFiveMinutes(
             startDate
-                ?? Date().addingTimeInterval(TimeInterval(settings.startBufferMinutes * 60))
+                ?? now.addingTimeInterval(TimeInterval(settings.startBufferMinutes * 60))
         )
         let windowEnd = task.deadline.addingTimeInterval(
             -Double(settings.deadlineBufferMinutes) * 60
@@ -238,7 +239,7 @@ struct SchedulerService {
         let retainedLockedMinutes = retainedLockedCoverageMinutes(
             for: task,
             in: remainingBlocks,
-            from: planningStart,
+            from: now,
             to: windowEnd
         )
         let requestedMinutes = max(0, task.remainingMinutes - retainedLockedMinutes)
@@ -352,7 +353,7 @@ struct SchedulerService {
             let retainedLockedMinutes = retainedLockedCoverageMinutes(
                 for: task,
                 in: kept,
-                from: start,
+                from: now,
                 to: windowEnd
             )
             let requestedMinutes = max(0, task.remainingMinutes - retainedLockedMinutes)
@@ -918,15 +919,16 @@ struct SchedulerService {
 
     /// Locked blocks stay where the user put them, but only the portion that
     /// can still satisfy this scheduling pass counts as retained coverage.
-    /// Time before planning starts and time after the buffered deadline cannot
-    /// reduce the amount that must be placed inside the usable window.
+    /// Elapsed time and time after the buffered deadline cannot reduce the
+    /// amount that must be placed inside the usable window. A still-future lock
+    /// counts even when an explicit custom start pushes replacement work later.
     private static func retainedLockedCoverageMinutes(
         for task: FilumaTask,
         in blocks: [ScheduledBlock],
-        from planningStart: Date,
+        from coverageStart: Date,
         to windowEnd: Date
     ) -> Int {
-        guard planningStart < windowEnd else { return 0 }
+        guard coverageStart < windowEnd else { return 0 }
 
         return blocks.reduce(0) { total, block in
             guard block.task?.id == task.id,
@@ -935,7 +937,7 @@ struct SchedulerService {
                 return total
             }
 
-            let overlapStart = max(block.startTime, planningStart)
+            let overlapStart = max(block.startTime, coverageStart)
             let overlapEnd = min(block.endTime, windowEnd)
             guard overlapStart < overlapEnd else { return total }
 

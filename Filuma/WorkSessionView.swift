@@ -29,16 +29,62 @@ enum WorkSessionBlockSelector {
     }
 }
 
+/// A presented work-session screen does not own Filuma's global timer merely
+/// because it is visible. Only a locally started or recovered session may
+/// record attendance when the sheet goes away. This keeps an idle sheet for a
+/// second task from tearing down the first task's recovery journal.
+enum WorkSessionDismissalPolicy {
+    static func shouldRecord(localSessionID: UUID?) -> Bool {
+        localSessionID != nil
+    }
+}
+
+/// Plain, testable copy policy for the post-session receipt. A timer that was
+/// stopped before one whole second has no durable attendance row, so it must
+/// never borrow the language used for banked work.
+struct WorkSessionReceiptCopy: Equatable {
+    let eyebrow: String
+    let title: String
+    let message: String
+    let durationLabel: String
+    let detailLabel: String
+
+    static func make(loggedSeconds: Int, scheduledBlock: Bool) -> Self {
+        guard loggedSeconds > 0 else {
+            return Self(
+                eyebrow: "THREAD OPEN",
+                title: "Session ended",
+                message: "No time was added. You can still update task progress if you need to.",
+                durationLabel: "No time added",
+                detailLabel: "Your task and schedule are unchanged"
+            )
+        }
+
+        return Self(
+            eyebrow: "THREAD HELD",
+            title: "Session logged",
+            message: "Your time is safely banked. Updating task progress is optional.",
+            durationLabel: CountdownFormatter.timerString(seconds: loggedSeconds),
+            detailLabel: scheduledBlock
+                ? "Time logged to scheduled block"
+                : "Focus time banked"
+        )
+    }
+}
+
 /// The held flame: a full-height focus timer for a single task. Start/pause/
 /// stop a session around the glowing ring, then self-report overall progress.
 /// Saving at 100% completes the task.
 struct WorkSessionView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     let task: FilumaTask
-    /// Called with `true` when the user reported the task finished.
-    var onFinish: (Bool) -> Void
+    /// A non-nil receipt means completion is already durable. The presenting
+    /// view may delay only its ritual while this full-screen cover dismisses.
+    var onFinish: (TaskCompletionReceipt?) -> Void
 
     @State private var isRunning = false
     @State private var isPaused = false
@@ -78,6 +124,10 @@ struct WorkSessionView: View {
     @State private var didWarnNearEnd = false
     @State private var didMarkBlockEnd = false
     @State private var immersionMessage: String?
+    @State private var sessionIssue: SessionIssue?
+    @State private var loggedSessionSeconds = 0
+    @State private var loggedScheduledBlock = false
+    @AccessibilityFocusState private var progressHeadingFocused: Bool
 
     // Micro-start: a deliberately tiny commitment. "Work on the essay" is
     // unstartable; "ten minutes" is a dare you can take.
@@ -92,21 +142,45 @@ struct WorkSessionView: View {
     /// the same schedule clock through pauses.
     @State private var now = Date()
 
-    var body: some View {
-        VStack(spacing: 0) {
-            header
+    private struct SessionIssue: Identifiable {
+        let id = UUID()
+        let title: String
+        let message: String
+    }
 
-            if showProgressPrompt {
-                progressPrompt
-            } else {
-                timerBody
+    var body: some View {
+        ZStack {
+            // The ring owns the light. A quieter ember field preserves the
+            // living Hearthlight atmosphere without competing for attention.
+            HearthScreenBackground(
+                topGlow: 0.04,
+                bottomGlow: 0.34,
+                embers: isRunning ? 10 : 14,
+                emberIntensity: 0.7
+            )
+
+            VStack(spacing: 0) {
+                header
+                    .padding(.horizontal, 24)
+
+                ScrollView {
+                    Group {
+                        if showProgressPrompt {
+                            progressPrompt
+                        } else {
+                            timerBody
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 28)
+                }
+                .scrollIndicators(.hidden)
+                .scrollBounceBehavior(.basedOnSize)
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    actionBar
+                }
             }
         }
-        .padding(.horizontal, 24)
-        .padding(.bottom, 30)
-        // The held flame at full strength: no top glow to compete with the
-        // ring, a hot floor, and the densest ember field in the app.
-        .hearthScreen(topGlow: 0.05, bottomGlow: 0.5, embers: 30, emberIntensity: 1.5)
         .onAppear {
             rehydrateIfNeeded()
         }
@@ -145,41 +219,85 @@ struct WorkSessionView: View {
             }
         }
         .onDisappear {
-            // A running sheet can still disappear without Stop. Record through
-            // the same durable path; after Stop, elapsedSeconds is already zero
-            // so this remains idempotent.
-            recordSession()
+            // A locally owned running sheet can still disappear without Stop.
+            // An idle sheet owns nothing: recording it would otherwise reach
+            // shared teardown and could erase another task's active session.
+            if WorkSessionDismissalPolicy.shouldRecord(
+                localSessionID: activeSessionID
+            ) {
+                recordSession()
+            }
             UIApplication.shared.isIdleTimerDisabled = false
+        }
+        .onChange(of: showProgressPrompt) { _, showing in
+            guard showing else { return }
+            Task { @MainActor in
+                await Task.yield()
+                progressHeadingFocused = true
+            }
+        }
+        .alert(item: $sessionIssue) { issue in
+            Alert(
+                title: Text(issue.title),
+                message: Text(issue.message),
+                dismissButton: .default(Text("OK"))
+            )
         }
     }
 
     // MARK: - Header
 
     private var header: some View {
-        HStack {
-            Button("Close") {
-                if isRunning {
-                    stopTapped()
-                } else {
-                    onFinish(false)
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                HStack(spacing: 16) {
+                    headerTitle
+                    Spacer(minLength: 8)
+                    headerAction
+                }
+            } else {
+                ZStack {
+                    headerTitle
+                    HStack {
+                        headerAction
+                        Spacer()
+                    }
                 }
             }
-            .font(AppFont.caption(14))
-            .foregroundStyle(Color.filumaSubtle)
-            .contentShape(Rectangle().inset(by: -14))
-
-            Spacer()
-
-            Text("Work Session")
-                .font(AppFont.cardTitle(15))
-                .foregroundStyle(Color.filumaText)
-
-            Spacer()
-
-            Color.clear.frame(width: 44, height: 1)
         }
+        .frame(minHeight: 44)
         .padding(.top, 18)
         .padding(.bottom, 18)
+    }
+
+    private var headerTitle: some View {
+        Text("Work Session")
+            .font(AppFont.cardTitle(15))
+            .foregroundStyle(Color.filumaText)
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
+            .accessibilityIdentifier("workSession.title")
+    }
+
+    private var headerAction: some View {
+        Button(isRunning ? "End" : "Close") {
+            if isRunning {
+                stopTapped()
+            } else {
+                onFinish(nil)
+            }
+        }
+        .font(AppFont.caption(14))
+        .foregroundStyle(Color.filumaSubtle)
+        .frame(minWidth: 44, minHeight: 44)
+        .contentShape(Rectangle())
+        .hearthPressStyle(scale: 0.96, pressedOpacity: 0.75)
+        .accessibilityIdentifier("workSession.close")
+        .accessibilityHint(
+            isRunning
+                ? "Logs this session and opens the progress update"
+                : "Closes the work session"
+        )
     }
 
     // MARK: - Timer
@@ -193,6 +311,7 @@ struct WorkSessionView: View {
                     .font(AppFont.cardTitle(22))
                     .foregroundStyle(Color.filumaText)
                     .multilineTextAlignment(.center)
+                    .accessibilityIdentifier("workSession.taskTitle")
                 Text(budgetLabel)
                     .font(AppFont.monoMedium(13))
                     .foregroundStyle(isOverBudgetNow ? Color.workDisplay : Color.filumaSubtle)
@@ -232,8 +351,6 @@ struct WorkSessionView: View {
             }
             .padding(.top, 6)
 
-            Spacer()
-
             VStack(spacing: 26) {
                 heldFlameRing
 
@@ -250,23 +367,25 @@ struct WorkSessionView: View {
                     }
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
-                    .background(Color.brand500.opacity(0.12), in: Capsule())
-                    .overlay(Capsule().stroke(Color.brand500.opacity(0.35), lineWidth: 1))
-                    .hearthGlow(.brand500, radius: 14, opacity: 0.25)
-                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                    .background(Color.brand500.opacity(0.08), in: Capsule())
+                    .overlay(Capsule().stroke(Color.brand500.opacity(0.22), lineWidth: 1))
+                    .transition(
+                        reduceMotion
+                            ? .opacity
+                            : .opacity.combined(with: .scale(scale: 0.92))
+                    )
                 }
 
                 if isRunning, let end = blockEndTarget {
-                    Text("block ends \(TimeFormatter.clock.string(from: end)) · schedule holds until then")
+                    Text(blockBoundaryLabel(end: end))
                         .font(AppFont.monoMedium(12))
                         .foregroundStyle(Color.filumaFaint)
+                        .multilineTextAlignment(.center)
                 }
             }
-
-            Spacer()
-
-            footer
+            .padding(.top, 28)
         }
+        .padding(.bottom, 24)
     }
 
     /// The 200pt held-flame ring: pulsing halo, conic accent arc, inner dark
@@ -277,24 +396,24 @@ struct WorkSessionView: View {
                 progress: ringProgress,
                 size: 200,
                 lineWidth: 13,
-                showsHalo: isRunning && !isPaused
+                showsHalo: isRunning && !isPaused && !hasBlockEnded
             )
 
             Circle()
                 .fill(
                     // Light pools near the top of the disc (`circle at 50% 28%`).
                     RadialGradient(
-                        colors: [Color(hex: 0x1E1E22), Color(hex: 0x131316)],
+                        colors: [Color.filumaSurface2, Color.filumaSurface],
                         center: UnitPoint(x: 0.5, y: 0.28),
                         startRadius: 10,
                         endRadius: 130
                     )
                 )
-                .overlay(Circle().stroke(Color.white.opacity(0.06), lineWidth: 1))
+                .overlay(Circle().stroke(Color.filumaBorder, lineWidth: 1))
                 .frame(width: 168, height: 168)
 
             VStack(spacing: 8) {
-                Text(timerLabel)
+                Text(primaryTimerLabel)
                     .font(AppFont.mono(38))
                     .foregroundStyle(isRunning && !isPaused ? Color.filumaText : Color.filumaSubtle)
                     .contentTransition(.numericText())
@@ -310,49 +429,57 @@ struct WorkSessionView: View {
                         .foregroundStyle(Color.brand300)
                         .kerning(2)
                 }
+
+                if isRunning {
+                    Text("\(CountdownFormatter.timerString(seconds: elapsedSeconds)) focused")
+                        .font(AppFont.monoMedium(11))
+                        .foregroundStyle(Color.filumaFaint)
+                }
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(statusLabel.capitalized)
-            .accessibilityValue(timerLabel)
+            .accessibilityValue(timerAccessibilityValue)
+            .accessibilityIdentifier("workSession.timer")
         }
         .frame(width: 244, height: 244)
     }
 
-    // MARK: - Footer
+    // MARK: - Fixed actions
+
+    private var actionBar: some View {
+        Group {
+            if showProgressPrompt {
+                progressActions
+            } else {
+                sessionControls
+            }
+        }
+        .padding(.horizontal, 24)
+        .padding(.top, 14)
+        .padding(.bottom, 12)
+        .frame(maxWidth: .infinity)
+        .background(Color.filumaBackground.opacity(0.97).ignoresSafeArea(edges: .bottom))
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.filumaBorder)
+                .frame(height: 1)
+        }
+    }
 
     @ViewBuilder
-    private var footer: some View {
+    private var sessionControls: some View {
         if isRunning {
-            HStack(spacing: 12) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        togglePause()
-                    }
-                } label: {
-                    Text(isPaused ? "Resume" : "Pause")
-                        .font(AppFont.heading(16))
-                        .foregroundStyle(Color.filumaText)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 16)
-                        .background(
-                            RoundedRectangle(cornerRadius: FilumaRadius.card, style: .continuous)
-                                .fill(Color.white.opacity(0.04))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: FilumaRadius.card, style: .continuous)
-                                .stroke(Color.white.opacity(0.12), lineWidth: 1)
-                        )
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(spacing: 12) {
+                    pauseButton
+                    stopButton
                 }
-                .buttonStyle(.plain)
-                .frame(maxWidth: 130)
-
-                Button {
-                    stopTapped()
-                } label: {
-                    Text("Stop & log progress")
-                        .primaryButtonStyle()
+            } else {
+                HStack(spacing: 12) {
+                    pauseButton
+                        .frame(maxWidth: 138)
+                    stopButton
                 }
-                .buttonStyle(.plain)
             }
         } else {
             VStack(spacing: 12) {
@@ -367,7 +494,8 @@ struct WorkSessionView: View {
                     }
                     .primaryButtonStyle()
                 }
-                .buttonStyle(.plain)
+                .hearthPressStyle(scale: 0.98, pressedOpacity: 0.88)
+                .accessibilityIdentifier("workSession.start")
 
                 Button {
                     startTapped(microMinutes: 10)
@@ -375,58 +503,156 @@ struct WorkSessionView: View {
                     Text("Just 10 minutes")
                         .font(AppFont.caption(13))
                         .foregroundStyle(Color.brand300)
-                        .padding(.horizontal, 18)
-                        .padding(.vertical, 10)
-                        .overlay(
-                            Capsule().stroke(Color.brand500.opacity(0.4), lineWidth: 1)
-                        )
+                        // Keep the 44pt boundary inside the native label. A
+                        // frame applied after Button does not enlarge the
+                        // synthesized accessibility or hit-test geometry.
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .overlay(Capsule().stroke(Color.brand500.opacity(0.32), lineWidth: 1))
                 }
-                .buttonStyle(.plain)
-                .contentShape(Rectangle().inset(by: -6))
+                .hearthPressStyle(scale: 0.97, pressedOpacity: 0.82)
+                .accessibilityIdentifier("workSession.microStart")
             }
+        }
+    }
+
+    private var pauseButton: some View {
+        Button {
+            withAnimation(reduceMotion ? HearthMotion.reduced : HearthMotion.selection) {
+                togglePause()
+            }
+        } label: {
+            Label(
+                isPaused ? "Resume" : "Pause",
+                systemImage: isPaused ? "play.fill" : "pause.fill"
+            )
+            .font(AppFont.heading(16))
+            .foregroundStyle(Color.filumaText)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 16)
+            .background(
+                RoundedRectangle(cornerRadius: FilumaRadius.button, style: .continuous)
+                    .fill(Color.filumaSurface2)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: FilumaRadius.button, style: .continuous)
+                    .stroke(Color.filumaBorder, lineWidth: 1)
+            )
+        }
+        .hearthPressStyle(scale: 0.97, pressedOpacity: 0.82)
+        .accessibilityIdentifier("workSession.pause")
+    }
+
+    private var stopButton: some View {
+        Button {
+            stopTapped()
+        } label: {
+            Text("End & log session")
+                .primaryButtonStyle()
+        }
+        .hearthPressStyle(scale: 0.98, pressedOpacity: 0.88)
+        .accessibilityIdentifier("workSession.stop")
+    }
+
+    private var progressActions: some View {
+        VStack(spacing: 12) {
+            Button {
+                saveProgress()
+            } label: {
+                Text("Save progress")
+                    .primaryButtonStyle(fill: task.context.color)
+            }
+            .hearthPressStyle(scale: 0.98, pressedOpacity: 0.88)
+            .accessibilityIdentifier("workSession.saveProgress")
+
+            Button("Not now") {
+                onFinish(nil)
+            }
+            .font(AppFont.heading(15))
+            .foregroundStyle(Color.filumaSubtle)
+            .frame(maxWidth: .infinity, minHeight: 44)
+            .contentShape(Rectangle())
+            .hearthPressStyle(scale: 0.98, pressedOpacity: 0.76)
+            .accessibilityHint("Closes this session without changing overall task progress")
+            .accessibilityIdentifier("workSession.notNow")
         }
     }
 
     // MARK: - Progress prompt
 
     private var progressPrompt: some View {
-        VStack(spacing: 16) {
-            Spacer()
+        let copy = receiptCopy
 
-            Text("Nice work!")
-                .font(AppFont.title(22))
-                .foregroundStyle(LinearGradient.hearthTitle)
-            Text("You wove for \(sessionLengthLabel).")
-                .font(AppFont.body(14))
-                .foregroundStyle(Color.filumaSubtle)
+        return VStack(spacing: 22) {
+            VStack(spacing: 8) {
+                Text(copy.eyebrow)
+                    .font(AppFont.caption(11))
+                    .foregroundStyle(Color.brand300)
+                    .kerning(1.8)
 
-            VStack(spacing: 10) {
-                Text("How much of this task is done overall?")
-                    .font(AppFont.body(13))
+                Text(copy.title)
+                    .font(AppFont.title(24))
+                    .foregroundStyle(Color.filumaText)
+                    .accessibilityAddTraits(.isHeader)
+                    .accessibilityFocused($progressHeadingFocused)
+                    .accessibilityIdentifier("workSession.loggedTitle")
+
+                Text(copy.message)
+                    .font(AppFont.body(14))
                     .foregroundStyle(Color.filumaSubtle)
+                    .multilineTextAlignment(.center)
+            }
+
+            VStack(alignment: .leading, spacing: 14) {
+                Label(
+                    copy.durationLabel,
+                    systemImage: loggedSessionSeconds > 0 ? "timer" : "clock"
+                )
+                Label(
+                    copy.detailLabel,
+                    systemImage: loggedSessionSeconds == 0
+                        ? "arrow.counterclockwise"
+                        : (loggedScheduledBlock ? "calendar.badge.checkmark" : "flame.fill")
+                )
+            }
+            .font(AppFont.bodySemibold(14))
+            .foregroundStyle(Color.filumaText)
+            .symbolRenderingMode(.hierarchical)
+            .tint(task.context.displayColor)
+            .padding(18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.filumaSurface)
+            .clipShape(RoundedRectangle(cornerRadius: FilumaRadius.card, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: FilumaRadius.card, style: .continuous)
+                    .stroke(Color.filumaBorder, lineWidth: 1)
+            }
+            .accessibilityElement(children: .combine)
+
+            VStack(spacing: 12) {
+                Text("Update overall task progress?")
+                    .font(AppFont.bodySemibold(15))
+                    .foregroundStyle(Color.filumaText)
+                    .multilineTextAlignment(.center)
+
                 Text("\(Int(progressValue))%")
                     .font(AppFont.mono(34))
                     .foregroundStyle(task.context.displayColor)
                     .contentTransition(.numericText())
-                Slider(value: $progressValue, in: sliderRange, step: 5)
+
+                Slider(value: $progressValue, in: sliderRange, step: 1)
                     .tint(task.context.color)
+                    .accessibilityLabel("Overall task progress")
+                    .accessibilityValue("\(Int(progressValue)) percent")
             }
-            .padding(.top, 8)
-
-            Button {
-                saveProgress()
-            } label: {
-                Text("Save Progress")
-                    .primaryButtonStyle(fill: task.context.color)
-            }
-            .padding(.top, 10)
-
-            Spacer()
         }
+        .padding(.top, 28)
+        .padding(.bottom, 24)
     }
 
     private var sliderRange: ClosedRange<Double> {
-        let minimum = Double(min(task.progressPercent, 95))
+        // The UI and persistence boundary share the same monotonic rule. A
+        // 99% task may move to 100%, but can never appear to save a regression.
+        let minimum = Double(min(max(task.progressPercent, 0), 99))
         return minimum...100
     }
 
@@ -448,26 +674,54 @@ struct WorkSessionView: View {
             : "\(spent) of \(budget) budget used"
     }
 
-    private var sessionLengthLabel: String {
-        CountdownFormatter.effortString(minutes: max(1, elapsedSeconds / 60))
+    private var receiptCopy: WorkSessionReceiptCopy {
+        WorkSessionReceiptCopy.make(
+            loggedSeconds: loggedSessionSeconds,
+            scheduledBlock: loggedScheduledBlock
+        )
     }
 
-    /// Counts down to the block end while working inside a block; otherwise
-    /// counts the session up.
-    private var timerLabel: String {
+    private var hasBlockEnded: Bool {
+        guard isRunning, let end = blockEndTarget else { return false }
+        return now >= end
+    }
+
+    /// The dominant number has one stable meaning for the lifetime of a
+    /// scheduled session: block time remaining. Floating sessions use focused
+    /// time instead. At the boundary the block clock banks at zero rather than
+    /// abruptly changing into the other clock.
+    private var primaryTimerLabel: String {
         if isRunning, let end = blockEndTarget {
-            let remaining = Int(end.timeIntervalSinceNow)
-            if remaining > 0 {
-                return CountdownFormatter.timerString(seconds: remaining)
-            }
+            let remaining = max(0, Int(end.timeIntervalSince(now)))
+            return CountdownFormatter.timerString(seconds: remaining)
         }
         return CountdownFormatter.timerString(seconds: elapsedSeconds)
     }
 
     private var statusLabel: String {
         if !isRunning { return "READY" }
-        if isPaused { return "RESTING" }
-        return "WEAVING"
+        if isPaused { return "PAUSED" }
+        if hasBlockEnded { return "BLOCK ENDED" }
+        if blockEndTarget != nil { return "BLOCK LEFT" }
+        return "FOCUSED"
+    }
+
+    private var timerAccessibilityValue: String {
+        let focused = CountdownFormatter.timerString(seconds: elapsedSeconds)
+        if blockEndTarget != nil {
+            if hasBlockEnded {
+                return "Block ended, \(focused) focused"
+            }
+            return "\(primaryTimerLabel) left in block, \(focused) focused"
+        }
+        return "\(focused) focused"
+    }
+
+    private func blockBoundaryLabel(end: Date) -> String {
+        if now >= end {
+            return "block ended \(TimeFormatter.clock.string(from: end)) · your time stays safe"
+        }
+        return "block ends \(TimeFormatter.clock.string(from: end)) · schedule holds until then"
     }
 
     /// How much of the flame is held: the wall-clock fraction of the ring
@@ -509,8 +763,15 @@ struct WorkSessionView: View {
            journalTaskID != task.id {
             // Filuma has one active timer. Never overwrite another task's
             // recovery journal just because this screen was presented.
+            presentIssue(
+                title: "Another session is running",
+                message: "End the active work session before starting this one. Its timer and recovery record are still safe."
+            )
             return
         }
+        sessionIssue = nil
+        loggedSessionSeconds = 0
+        loggedScheduledBlock = false
         let now = Date()
         let sessionID = UUID()
         self.now = now // the ring's clock starts at the same instant
@@ -520,7 +781,9 @@ struct WorkSessionView: View {
         pausedAccumSeconds = 0
         pauseBegan = nil
         isPaused = false
-        withAnimation { isRunning = true }
+        withAnimation(reduceMotion ? HearthMotion.reduced : HearthMotion.reveal) {
+            isRunning = true
+        }
 
         // Immersion: the screen stays awake for the whole session, and the
         // running block's end becomes the gentle boundary chime.
@@ -577,6 +840,7 @@ struct WorkSessionView: View {
             ringStartsAt: ringStart,
             ringEndsAt: ringStart.addingTimeInterval(TimeInterval(window))
         )
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
     }
 
     /// Rebuilds the foreground timer from the App Group journal after iOS has
@@ -662,11 +926,14 @@ struct WorkSessionView: View {
         pauseBegan = control.pauseBeganAt
         elapsedSeconds = control.elapsedWorkedSeconds(at: date)
         if isPaused != control.isPaused {
-            withAnimation { isPaused = control.isPaused }
+            withAnimation(reduceMotion ? HearthMotion.reduced : HearthMotion.selection) {
+                isPaused = control.isPaused
+            }
         }
     }
 
     private func togglePause() {
+        UISelectionFeedbackGenerator().selectionChanged()
         let now = Date()
         if let activeSessionID,
            var control = WorkSessionControlStore.load(sessionID: activeSessionID) {
@@ -716,7 +983,7 @@ struct WorkSessionView: View {
         guard let goal = microGoalSeconds, !didHitMicroGoal, elapsedSeconds >= goal else { return }
         didHitMicroGoal = true
         UINotificationFeedbackGenerator().notificationOccurred(.success)
-        withAnimation {
+        withAnimation(reduceMotion ? HearthMotion.reduced : HearthMotion.reveal) {
             immersionMessage = "10-minute dare met · keep going?"
         }
     }
@@ -731,13 +998,13 @@ struct WorkSessionView: View {
         if remaining <= 600 && remaining > 0 && !didWarnNearEnd {
             didWarnNearEnd = true
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-            withAnimation {
+            withAnimation(reduceMotion ? HearthMotion.reduced : HearthMotion.reveal) {
                 immersionMessage = "About 10 minutes left in this block — a good stopping point is coming."
             }
         } else if remaining <= 0 && !didMarkBlockEnd {
             didMarkBlockEnd = true
             UINotificationFeedbackGenerator().notificationOccurred(.success)
-            withAnimation {
+            withAnimation(reduceMotion ? HearthMotion.reduced : HearthMotion.reveal) {
                 immersionMessage = "Block done. Stopping now is a win — no heroics required."
             }
         }
@@ -747,7 +1014,8 @@ struct WorkSessionView: View {
         // Commit the work log and attendance before the progress prompt. The
         // app may be backgrounded or terminated while that prompt is visible.
         guard recordSession() else { return }
-        withAnimation {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        withAnimation(reduceMotion ? HearthMotion.reduced : HearthMotion.reveal) {
             isRunning = false
             isPaused = false
             progressValue = Double(task.progressPercent)
@@ -761,14 +1029,21 @@ struct WorkSessionView: View {
             syncSharedControl(at: Date())
         }
         guard elapsedSeconds > 0 else {
+            loggedSessionSeconds = 0
+            loggedScheduledBlock = false
             finishRecordedSession()
             // A sub-second start/stop has no attendance to persist, so it is
             // already safe to finish any calendar repair that waited for the
             // timer's ownership to clear.
-            PlanCoordinator.resumeDeferredBusyTimeConflictReplan(
-                context: modelContext
-            )
-            try? modelContext.save()
+            do {
+                _ = try PlanCoordinator.resumeDeferredBusyTimeConflictReplan(
+                    context: modelContext
+                )
+            } catch {
+                // The coordinator restores the deferred request on failure, so
+                // a later foreground pass can retry without misreporting this
+                // already-complete zero-duration stop as a logging failure.
+            }
             return true
         }
         let session: WorkSession
@@ -778,7 +1053,10 @@ struct WorkSessionView: View {
             session.durationSeconds = elapsedSeconds
             didCompleteLinkedBlock = pendingAttendanceCompletedLinkedBlock
         } else {
-            guard let attendanceID = activeSessionID else { return false }
+            guard let attendanceID = activeSessionID else {
+                presentSessionLogFailure()
+                return false
+            }
             let descriptor = FetchDescriptor<WorkSession>(
                 predicate: #Predicate { $0.id == attendanceID }
             )
@@ -811,6 +1089,7 @@ struct WorkSessionView: View {
                 }
             } catch {
                 UINotificationFeedbackGenerator().notificationOccurred(.error)
+                presentSessionLogFailure()
                 return false
             }
             // The first step's whole job is getting the first session started;
@@ -830,35 +1109,63 @@ struct WorkSessionView: View {
                 // Keep the recovery journal, Live Activity, and foreground
                 // timer intact. A later Stop can retry the pending context.
                 UINotificationFeedbackGenerator().notificationOccurred(.error)
+                presentSessionLogFailure()
                 return false
             }
         }
-        pendingAttendanceRecord = nil
-        pendingAttendanceCompletedLinkedBlock = false
-        finishRecordedSession()
         if didCompleteLinkedBlock {
             // Attendance consumed one reservation without changing self-
             // reported progress. Restore coverage for the unchanged remainder;
-            // saving progress later may legitimately reconcile once more.
-            PlanCoordinator.reconcileTaskAfterProgress(task, context: modelContext)
-            try? modelContext.save()
+            // saving progress later may legitimately reconcile once more. Do
+            // not clear the recovery journal or end the Live Activity until
+            // the replacement plan is durable too.
+            do {
+                try PlanCoordinator.reconcileTaskAfterAttendance(
+                    task,
+                    context: modelContext
+                )
+            } catch {
+                // Attendance itself is already durable. Keep this same session
+                // identity, timer UI, journal, and Live Activity alive so a
+                // later End tap updates and retries one row instead of adding
+                // a duplicate.
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+                presentPlanRefreshFailure()
+                return false
+            }
         } else {
             PlanCoordinator.publishChange(context: modelContext)
         }
+        sessionIssue = nil
+        loggedSessionSeconds = elapsedSeconds
+        loggedScheduledBlock = didCompleteLinkedBlock
+        pendingAttendanceRecord = nil
+        pendingAttendanceCompletedLinkedBlock = false
+        finishRecordedSession()
         // Google import can finish while this timer still owns its scheduled
         // block. Repair those conflicts only after the session and attendance
         // above are durable, then persist the resulting plan before returning.
-        PlanCoordinator.resumeDeferredBusyTimeConflictReplan(
-            context: modelContext
-        )
-        try? modelContext.save()
+        do {
+            _ = try PlanCoordinator.resumeDeferredBusyTimeConflictReplan(
+                context: modelContext
+            )
+        } catch {
+            // Attendance is already durable and the deferred request was put
+            // back. Do not claim the conflict repair succeeded or undo the
+            // user's logged work; foreground activation will retry it.
+        }
         return true
     }
 
     /// Shared teardown is deliberately separate from attendance mutation so a
     /// failed SwiftData save cannot erase the only recoverable session state.
     private func finishRecordedSession() {
-        WorkSessionActivityController.end()
+        // Scope shared teardown to the identity this view started or recovered.
+        // If a stale view finishes after another task has claimed the journal,
+        // the controller leaves that newer journal and Live Activity untouched.
+        if let activeSessionID {
+            WorkSessionActivityController.end(sessionID: activeSessionID)
+        }
         UIApplication.shared.isIdleTimerDisabled = false
         isRunning = false
         isPaused = false
@@ -876,10 +1183,55 @@ struct WorkSessionView: View {
 
     private func saveProgress() {
         let reported = Int(progressValue)
-        task.manualProgressPercent = max(task.manualProgressPercent, reported)
-        if reported < 100 {
-            PlanCoordinator.reconcileTaskAfterProgress(task, context: modelContext)
+        if reported >= 100 {
+            do {
+                let receipt = try PlanCoordinator.completeTask(
+                    task,
+                    context: modelContext,
+                    reportedProgress: reported
+                )
+                onFinish(receipt)
+            } catch {
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+                presentIssue(
+                    title: "Progress not saved yet",
+                    message: "Filuma couldn’t save this completion yet. Your logged session is safe—try Save progress again."
+                )
+            }
+        } else {
+            do {
+                try PlanCoordinator.savePartialProgress(
+                    task,
+                    reportedProgress: reported,
+                    context: modelContext,
+                    interactive: false
+                )
+                onFinish(nil)
+            } catch {
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+                presentIssue(
+                    title: "Progress not saved yet",
+                    message: "Filuma couldn’t save this progress yet. Your logged session is safe—try Save progress again."
+                )
+            }
         }
-        onFinish(reported >= 100)
+    }
+
+    private func presentSessionLogFailure() {
+        presentIssue(
+            title: "Session not logged yet",
+            message: "Your timer is still safe and still running. Try End & log session again."
+        )
+    }
+
+    private func presentPlanRefreshFailure() {
+        presentIssue(
+            title: "Session logged; plan not refreshed yet",
+            message: "Your work is safely logged, but Filuma couldn’t refresh the remaining schedule. Your session is still open—try End & log session again."
+        )
+    }
+
+    private func presentIssue(title: String, message: String) {
+        sessionIssue = SessionIssue(title: title, message: message)
     }
 }

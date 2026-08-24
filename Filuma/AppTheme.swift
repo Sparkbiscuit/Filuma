@@ -138,6 +138,10 @@ extension Color {
     static let filumaSurface3 = Color(lightHex: 0xDEDEE3, darkHex: 0x2E2E33)
     static let filumaText = Color(lightHex: 0x1C1C1E, darkHex: 0xF5F5F7)
     static let filumaSubtle = Color(lightHex: 0x6E6E76, darkHex: 0x9A9AA2)
+    /// Ink for bright Hearth and context-filled controls. Unlike the ordinary
+    /// foreground token, this stays dark in both appearances so every accent
+    /// choice keeps button text legible.
+    static let filumaControlInk = Color(hex: 0x0F0F12)
     // Dark value must stay ≥ 4.5:1 against filumaBackground/filumaSurface —
     // filumaFaint is used for real content (timestamps, counts), not decoration.
     static let filumaFaint = Color(lightHex: 0x9A9AA2, darkHex: 0x86868E)
@@ -172,41 +176,21 @@ extension TaskContext {
 // MARK: - Gradients
 
 extension LinearGradient {
-    /// The signature CTA / FAB / toggle fill — `135deg, accentHi → accent` in
-    /// the prototype. accentHi keeps the button hot; accentSoft here would
-    /// wash it out (soft is reserved for glow text and the ring arc).
+    /// The signature CTA / FAB / toggle fill. The restrained
+    /// `accentHi → accentSoft` ramp stays luminous while preserving dark-ink
+    /// contrast across every Hearth accent.
     static var hearth: LinearGradient {
         let accent = HearthTheme.shared.accent
         return LinearGradient(
-            colors: [accent.hi, accent.color],
+            // Both stops are deliberately light enough for filumaControlInk.
+            // The old accentHi -> accent ramp made white labels fail contrast
+            // for Indigo and Sage, while dark labels failed on Ember/Violet.
+            colors: [accent.hi, accent.soft],
             startPoint: .topLeading,
             endPoint: .bottomTrailing
         )
     }
 
-    /// Vertical soft→accent fill for the Weave's "today" bar.
-    static var hearthBar: LinearGradient {
-        let accent = HearthTheme.shared.accent
-        return LinearGradient(
-            colors: [accent.soft, accent.color],
-            startPoint: .top,
-            endPoint: .bottom
-        )
-    }
-
-    /// Screen-title treatment: white holds through the first third, then
-    /// melts into accentSoft (`100deg, #F5F5F7 30%, accentSoft`).
-    static var hearthTitle: LinearGradient {
-        LinearGradient(
-            stops: [
-                .init(color: Color(hex: 0xF5F5F7), location: 0),
-                .init(color: Color(hex: 0xF5F5F7), location: 0.3),
-                .init(color: HearthTheme.shared.accent.soft, location: 1)
-            ],
-            startPoint: .leading,
-            endPoint: .trailing
-        )
-    }
 }
 
 // MARK: - Corner radii
@@ -228,6 +212,36 @@ enum FilumaLayout {
     static let readableContentMaxWidth: CGFloat = 760
     static let onboardingContentMaxWidth: CGFloat = 620
     static let tabBarMaxWidth: CGFloat = 620
+}
+
+/// A small spacing vocabulary for the repeated Hearthlight rhythms. One-off
+/// artwork can still use bespoke geometry; ordinary screens should compose
+/// from these steps instead of accumulating near-duplicate magic numbers.
+enum FilumaSpacing {
+    static let hairline: CGFloat = 4
+    static let compact: CGFloat = 8
+    static let related: CGFloat = 12
+    static let standard: CGFloat = 16
+    static let screen: CGFloat = 20
+    static let section: CGFloat = 24
+    static let chapter: CGFloat = 32
+    static let spacious: CGFloat = 40
+}
+
+// MARK: - Motion
+
+/// Hearthlight's shared motion vocabulary. Ordinary interface changes settle
+/// without bounce; momentum and celebration are the only places that should
+/// ever overshoot. Views that travel also need a Reduce Motion fallback.
+enum HearthMotion {
+    /// Touch release and small control changes.
+    static let control = Animation.spring(response: 0.24, dampingFraction: 1)
+    /// Selection indicators and compact state changes.
+    static let selection = Animation.spring(response: 0.32, dampingFraction: 1)
+    /// One-shot materialization for a screen's single explanatory moment.
+    static let reveal = Animation.timingCurve(0.16, 1, 0.3, 1, duration: 0.42)
+    /// Non-spatial feedback used when Reduce Motion is enabled.
+    static let reduced = Animation.easeOut(duration: 0.16)
 }
 
 // MARK: - Typography (Nunito + JetBrains Mono)
@@ -333,7 +347,7 @@ struct PrimaryButtonModifier: ViewModifier {
         let gradient: LinearGradient = {
             if let fill {
                 return LinearGradient(
-                    colors: [fill.opacity(0.85), fill],
+                    colors: [fill, fill],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 )
@@ -344,26 +358,30 @@ struct PrimaryButtonModifier: ViewModifier {
 
         return content
             .font(AppFont.heading(16))
-            .foregroundStyle(.white)
+            .foregroundStyle(enabled ? Color.filumaControlInk : Color.filumaSubtle)
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 16)
+            .padding(.vertical, FilumaSpacing.standard)
             .background(
                 RoundedRectangle(cornerRadius: FilumaRadius.button, style: .continuous)
                     .fill(enabled ? AnyShapeStyle(gradient) : AnyShapeStyle(Color.filumaSurface3))
             )
-            // The prototype's `inset 0 1px 0 rgba(255,255,255,0.35)` top rim.
+            // A quiet dark rim gives the bright control definition without
+            // putting translucent white decoration across every accent.
             .overlay(
                 RoundedRectangle(cornerRadius: FilumaRadius.button, style: .continuous)
                     .strokeBorder(
                         LinearGradient(
-                            colors: [.white.opacity(enabled ? 0.35 : 0), .white.opacity(0)],
+                            colors: [
+                                Color.filumaControlInk.opacity(enabled ? 0.14 : 0),
+                                Color.filumaControlInk.opacity(0)
+                            ],
                             startPoint: .top,
                             endPoint: .center
                         ),
                         lineWidth: 1
                     )
             )
-            .shadow(color: enabled ? glowColor.opacity(0.45) : .clear, radius: 14, y: 6)
+            .shadow(color: enabled ? glowColor.opacity(0.22) : .clear, radius: 10, y: 4)
     }
 }
 
@@ -376,6 +394,29 @@ struct HearthGlowModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content.shadow(color: color.opacity(opacity), radius: radius)
+    }
+}
+
+/// Immediate touch-down feedback with a critically damped release. Scaling is
+/// removed under Reduce Motion, while opacity still confirms the touch.
+struct HearthPressButtonStyle: ButtonStyle {
+    var pressedScale: CGFloat = 0.97
+    var pressedOpacity: Double = 0.9
+
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed && !reduceMotion ? pressedScale : 1)
+            .opacity(configuration.isPressed ? pressedOpacity : 1)
+            // Touch-down is immediate. Only the release settles, which keeps
+            // the control feeling attached to the user's finger.
+            .animation(
+                configuration.isPressed
+                    ? nil
+                    : (reduceMotion ? HearthMotion.reduced : HearthMotion.control),
+                value: configuration.isPressed
+            )
     }
 }
 
@@ -395,12 +436,23 @@ extension View {
     func hearthGlow(_ color: Color, radius: CGFloat = 12, opacity: Double = 0.4) -> some View {
         modifier(HearthGlowModifier(color: color, radius: radius, opacity: opacity))
     }
+
+    func hearthPressStyle(
+        scale: CGFloat = 0.97,
+        pressedOpacity: Double = 0.9
+    ) -> some View {
+        buttonStyle(HearthPressButtonStyle(
+            pressedScale: scale,
+            pressedOpacity: pressedOpacity
+        ))
+    }
 }
 
-// MARK: - Gradient screen title
+// MARK: - Screen title
 
-/// "Your Tasks" / "Schedule" / "Your Weave" — 900-weight with the two-color
-/// left-to-right melt into accentSoft.
+/// "Your Tasks" / "Schedule" / "Your Weave" — one clear typographic anchor.
+/// Accent belongs in the nearby thread, status, or rule rather than inside
+/// every display word.
 struct HearthTitle: View {
     let text: String
     var size: CGFloat = 30
@@ -408,7 +460,104 @@ struct HearthTitle: View {
     var body: some View {
         Text(text)
             .font(AppFont.title(size))
-            .foregroundStyle(LinearGradient.hearthTitle)
+            .foregroundStyle(Color.filumaText)
+    }
+}
+
+// MARK: - First-thread journey
+
+/// Filuma's smallest honest product diagram: capture a task, let the calendar
+/// hold it, then begin. It appears at first launch and again in the virgin
+/// Tasks state so the two moments feel like one continuous chapter.
+struct HearthThreadJourney: View {
+    let isRevealed: Bool
+    let reduceMotion: Bool
+
+    var body: some View {
+        ZStack {
+            Ellipse()
+                .fill(
+                    RadialGradient(
+                        stops: [
+                            .init(color: Color.brand500.opacity(0.18), location: 0),
+                            .init(color: Color.brand500.opacity(0.07), location: 0.42),
+                            .init(color: Color.clear, location: 0.72)
+                        ],
+                        center: .center,
+                        startRadius: 0,
+                        endRadius: 150
+                    )
+                )
+                .frame(width: 320, height: 210)
+                .blur(radius: 8)
+
+            HStack(spacing: 0) {
+                node(icon: "plus", size: 54, delay: 0)
+                connector(delay: 0.04)
+                node(icon: "calendar", size: 70, delay: 0.08, isPrimary: true)
+                connector(delay: 0.12)
+                node(icon: "play.fill", size: 54, delay: 0.16)
+            }
+            .frame(maxWidth: 300)
+        }
+        .frame(height: 148)
+        .accessibilityHidden(true)
+    }
+
+    private func node(
+        icon: String,
+        size: CGFloat,
+        delay: Double,
+        isPrimary: Bool = false
+    ) -> some View {
+        ZStack {
+            Circle()
+                .fill(Color.filumaSurface)
+            Circle()
+                .stroke(
+                    isPrimary ? Color.brand300.opacity(0.55) : Color.brand500.opacity(0.28),
+                    lineWidth: 1
+                )
+            if isPrimary {
+                Circle()
+                    .stroke(Color.brand500.opacity(0.2), lineWidth: 7)
+                    .blur(radius: 7)
+            }
+            Image(systemName: icon)
+                .font(.system(size: isPrimary ? 24 : 18, weight: .semibold))
+                .foregroundStyle(isPrimary ? Color.brand100 : Color.brand300)
+        }
+        .frame(width: size, height: size)
+        .hearthGlow(.brand500, radius: isPrimary ? 18 : 10, opacity: isPrimary ? 0.34 : 0.18)
+        .scaleEffect(reduceMotion ? 1 : (isRevealed ? 1 : 0.84))
+        .opacity(isRevealed ? 1 : 0)
+        .animation(revealAnimation(delay: delay), value: isRevealed)
+    }
+
+    private func connector(delay: Double) -> some View {
+        ZStack(alignment: .leading) {
+            Capsule()
+                .fill(Color.brand500.opacity(0.12))
+                .frame(height: 2)
+            Capsule()
+                .fill(
+                    LinearGradient(
+                        colors: [Color.brand300, Color.brand500],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+                .frame(height: 2)
+                .blur(radius: 0.4)
+        }
+        .frame(width: 56, height: 12)
+        .scaleEffect(x: reduceMotion ? 1 : (isRevealed ? 1 : 0), anchor: .leading)
+        .opacity(isRevealed ? 1 : 0)
+        .animation(revealAnimation(delay: delay), value: isRevealed)
+    }
+
+    private func revealAnimation(delay: Double) -> Animation {
+        reduceMotion ? HearthMotion.reduced : HearthMotion.reveal.delay(delay)
     }
 }
 
@@ -791,14 +940,13 @@ private final class EmberEmitterUIView: UIView {
     }
 }
 
-/// The standard Hearthlight screen backdrop: near-black canvas, warm glow
-/// banked above AND below ("hearth glow above, held flame below" — the bottom
-/// glow is the stronger of the two), and embers rising through everything.
-/// Defaults are the Tasks screen's prototype values (top 32%, bottom 34%).
+/// The standard Hearthlight screen backdrop: near-black canvas, a restrained
+/// header haze, one warmer held-light field below, and a sparse ember trace.
+/// Content remains the event; local focal objects may carry the stronger glow.
 struct HearthScreenBackground: View {
-    var topGlow: Double = 0.32
-    var bottomGlow: Double = 0.34
-    var embers: Int = 16
+    var topGlow: Double = 0.10
+    var bottomGlow: Double = 0.20
+    var embers: Int = 10
     var emberIntensity: Double = 1.0
 
     var body: some View {
@@ -807,27 +955,30 @@ struct HearthScreenBackground: View {
 
             RadialGradient(
                 stops: [
-                    .init(color: Color.brand500.opacity(topGlow), location: 0),
-                    .init(color: Color.brand500.opacity(topGlow * 0.2), location: 0.55),
+                    .init(color: Color.brand500.opacity(min(topGlow, 0.10)), location: 0),
+                    .init(color: Color.brand500.opacity(min(topGlow, 0.10) * 0.18), location: 0.48),
                     .init(color: .clear, location: 0.75)
                 ],
                 center: UnitPoint(x: 0.5, y: -0.1),
                 startRadius: 0,
-                endRadius: 520
+                endRadius: 340
             )
 
             RadialGradient(
                 stops: [
-                    .init(color: Color.brand500.opacity(bottomGlow), location: 0),
-                    .init(color: Color.brand500.opacity(bottomGlow * 0.24), location: 0.55),
+                    .init(color: Color.brand500.opacity(min(bottomGlow, 0.20)), location: 0),
+                    .init(color: Color.brand500.opacity(min(bottomGlow, 0.20) * 0.20), location: 0.52),
                     .init(color: .clear, location: 0.75)
                 ],
                 center: UnitPoint(x: 0.5, y: 1.06),
                 startRadius: 0,
-                endRadius: 460
+                endRadius: 380
             )
 
-            EmberField(emberCount: embers, intensity: emberIntensity)
+            EmberField(
+                emberCount: min(embers, 10),
+                intensity: min(emberIntensity, 0.75)
+            )
         }
         .ignoresSafeArea()
         .accessibilityHidden(true)
@@ -837,9 +988,9 @@ struct HearthScreenBackground: View {
 extension View {
     /// Wraps a screen in the hearth backdrop.
     func hearthScreen(
-        topGlow: Double = 0.32,
-        bottomGlow: Double = 0.34,
-        embers: Int = 16,
+        topGlow: Double = 0.10,
+        bottomGlow: Double = 0.20,
+        embers: Int = 10,
         emberIntensity: Double = 1.0
     ) -> some View {
         background(HearthScreenBackground(
@@ -905,7 +1056,7 @@ struct HearthProgressRing: View {
 
             // Track
             Circle()
-                .stroke(Color.white.opacity(0.07), lineWidth: lineWidth)
+                .stroke(Color.filumaBorder, lineWidth: lineWidth)
                 .frame(width: size, height: size)
 
             // The finished lap, banked: the block's worth of work is done and
@@ -990,11 +1141,20 @@ struct BreathingDot: View {
 /// styles must read from the environment.
 struct HearthToggleStyle: ToggleStyle {
     @Environment(\.labelsVisibility) private var labelsVisibility
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     func makeBody(configuration: Configuration) -> some View {
         Button {
-            withAnimation(.spring(response: 0.28, dampingFraction: 0.8)) {
-                configuration.isOn.toggle()
+            if reduceMotion {
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    configuration.isOn.toggle()
+                }
+            } else {
+                withAnimation(HearthMotion.selection) {
+                    configuration.isOn.toggle()
+                }
             }
         } label: {
             HStack {
@@ -1011,7 +1171,11 @@ struct HearthToggleStyle: ToggleStyle {
                     .frame(width: 46, height: 28)
                     .overlay(alignment: configuration.isOn ? .trailing : .leading) {
                         Circle()
-                            .fill(configuration.isOn ? Color.white : Color(hex: 0x8E8E96))
+                            .fill(
+                                configuration.isOn
+                                    ? Color.filumaControlInk
+                                    : Color.filumaSubtle
+                            )
                             .frame(width: 22, height: 22)
                             .padding(3)
                     }
@@ -1020,23 +1184,27 @@ struct HearthToggleStyle: ToggleStyle {
                         radius: 8
                     )
             }
+            // The label owns the real target. Framing only the synthesized
+            // Button host leaves accessibility focused on the 46x28 artwork.
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         // Keep the 46x28 artwork, but make the control itself meet Apple's
         // minimum comfortable target and expose native switch semantics to
         // assistive technologies instead of presenting as an unlabeled button.
         .frame(minWidth: 44, minHeight: 44)
-        .accessibilityRepresentation {
-            Toggle(
-                isOn: Binding(
-                    get: { configuration.isOn },
-                    set: { configuration.isOn = $0 }
-                )
-            ) {
-                configuration.label
-            }
-            .toggleStyle(.switch)
+        // Native UISwitch artwork exposes an intrinsic 46x28 accessibility
+        // leaf even when its layout wrapper is taller. Promote the real 44pt
+        // Hearth control instead, then explicitly retain native toggle role,
+        // label, and value semantics.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel { _ in
+            configuration.label
         }
+        .accessibilityValue(configuration.isOn ? "On" : "Off")
+        .accessibilityRemoveTraits(.isButton)
+        .accessibilityAddTraits(.isToggle)
     }
 }
 
@@ -1049,6 +1217,7 @@ struct EmptyStateView: View {
     let subtitle: String
     var actionLabel: String? = nil
     var action: (() -> Void)? = nil
+    var actionIdentifier: String? = nil
 
     var body: some View {
         VStack(spacing: 6) {
@@ -1079,14 +1248,22 @@ struct EmptyStateView: View {
                         .foregroundStyle(Color.brand300)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 9)
+                        // Put the minimum on the label itself: SwiftUI's
+                        // synthesized Button accessibility host otherwise
+                        // reports only the text/padding artwork (about 36pt).
+                        .frame(minHeight: 44)
                         .overlay(Capsule().stroke(Color.brand500.opacity(0.4), lineWidth: 1))
+                        .contentShape(Rectangle())
                 }
+                .hearthPressStyle(scale: 0.97, pressedOpacity: 0.86)
+                .frame(minHeight: 44)
                 .padding(.top, 10)
+                .accessibilityIdentifier(actionIdentifier ?? actionLabel)
             }
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 40)
-        .padding(.horizontal, 24)
+        .padding(.vertical, FilumaSpacing.spacious)
+        .padding(.horizontal, FilumaSpacing.section)
     }
 }
 
@@ -1106,8 +1283,8 @@ struct InfoBanner: View {
                 .foregroundStyle(Color.filumaText)
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
+        .padding(.horizontal, FilumaSpacing.standard)
+        .padding(.vertical, FilumaSpacing.related)
         .background(Color.filumaSurface)
         .clipShape(RoundedRectangle(cornerRadius: FilumaRadius.row, style: .continuous))
         .overlay(

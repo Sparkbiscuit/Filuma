@@ -142,12 +142,7 @@ final class GoogleCalendarTests: XCTestCase {
 
     @MainActor
     private func installFakeGoogleToken() throws {
-        try GoogleTokenStore.save(GoogleTokens(
-            accessToken: "test-access-token",
-            refreshToken: "test-refresh-token",
-            expiresAt: Date().addingTimeInterval(3600),
-            email: "test@example.com"
-        ))
+        GoogleCalendarService.loadImportAccessToken = { "test-access-token" }
     }
 
     @MainActor
@@ -156,13 +151,26 @@ final class GoogleCalendarTests: XCTestCase {
         GoogleCalendarMockURLProtocol.handler = nil
         GoogleCalendarService.urlSession = .shared
         GoogleCalendarService.saveContext = { try $0.save() }
+        GoogleCalendarService.loadBusyEvents = {
+            try $0.fetch(FetchDescriptor<BusyEvent>())
+        }
+        GoogleCalendarService.loadImportAccessToken = {
+            try await GoogleOAuth.validAccessToken(
+                urlSession: GoogleCalendarService.urlSession
+            )
+        }
+        GoogleCalendarService.loadExportAccessToken = {
+            try await GoogleOAuth.validAccessToken(
+                urlSession: GoogleCalendarService.urlSession
+            )
+        }
         GoogleTokenStore.clear()
     }
 
     @MainActor
     func testImportInsertsNewEvents() throws {
         let start = Date().addingTimeInterval(3600)
-        let changes = GoogleCalendarService.reconcileImport(
+        let changes = try GoogleCalendarService.reconcileImport(
             events: [gEvent(id: "e1", title: "Dentist", start: start, end: start.addingTimeInterval(1800))],
             fullSync: true,
             context: context
@@ -183,7 +191,7 @@ final class GoogleCalendarTests: XCTestCase {
         ))
 
         let newStart = start.addingTimeInterval(7200)
-        GoogleCalendarService.reconcileImport(
+        try GoogleCalendarService.reconcileImport(
             events: [gEvent(id: "e1", title: "Moved", start: newStart, end: newStart.addingTimeInterval(1800))],
             fullSync: false,
             context: context
@@ -202,7 +210,7 @@ final class GoogleCalendarTests: XCTestCase {
             startTime: start, endTime: start.addingTimeInterval(1800)
         ))
 
-        GoogleCalendarService.reconcileImport(
+        try GoogleCalendarService.reconcileImport(
             events: [gEvent(id: "e1", start: nil, end: nil, status: "cancelled")],
             fullSync: false,
             context: context
@@ -213,7 +221,7 @@ final class GoogleCalendarTests: XCTestCase {
     @MainActor
     func testImportSkipsAllDayAndFilumaTaggedEvents() throws {
         let start = Date().addingTimeInterval(3600)
-        GoogleCalendarService.reconcileImport(
+        try GoogleCalendarService.reconcileImport(
             events: [
                 gEvent(id: "allday", start: nil, end: nil, allDayDate: "2026-07-11"),
                 gEvent(id: "ours", title: "Filuma block", start: start,
@@ -235,11 +243,19 @@ final class GoogleCalendarTests: XCTestCase {
 
         // Incremental responses only carry deltas: an absent event is not a
         // deletion, so the mirror must survive.
-        GoogleCalendarService.reconcileImport(events: [], fullSync: false, context: context)
+        try GoogleCalendarService.reconcileImport(
+            events: [],
+            fullSync: false,
+            context: context
+        )
         XCTAssertEqual(try googleBusyEvents().count, 1)
 
         // A full window fetch is the whole truth: unmatched means gone.
-        GoogleCalendarService.reconcileImport(events: [], fullSync: true, context: context)
+        try GoogleCalendarService.reconcileImport(
+            events: [],
+            fullSync: true,
+            context: context
+        )
         XCTAssertTrue(try googleBusyEvents().isEmpty)
     }
 
@@ -251,7 +267,11 @@ final class GoogleCalendarTests: XCTestCase {
             startTime: start, endTime: start.addingTimeInterval(1800)
         ))
 
-        GoogleCalendarService.reconcileImport(events: [], fullSync: true, context: context)
+        try GoogleCalendarService.reconcileImport(
+            events: [],
+            fullSync: true,
+            context: context
+        )
         let apple = try context.fetch(FetchDescriptor<BusyEvent>())
             .filter { $0.source == .appleCalendar }
         XCTAssertEqual(apple.count, 1, "A Google full sync must never touch Apple-sourced busy events")
@@ -304,8 +324,12 @@ final class GoogleCalendarTests: XCTestCase {
             try context.save()
         }
 
-        await GoogleCalendarService.importNow(context: context, settings: settings)
+        let result = await GoogleCalendarService.importNow(
+            context: context,
+            settings: settings
+        )
 
+        XCTAssertEqual(result, .failed)
         XCTAssertEqual(saveCount, 2, "Import should checkpoint, then attempt its transaction save")
         XCTAssertEqual(settings.googleSyncToken, "original-token")
         // The strongest autosave guarantee: persist whatever is still pending
@@ -319,7 +343,784 @@ final class GoogleCalendarTests: XCTestCase {
     }
 
     @MainActor
-    func testConcurrentImportQueuesExactlyOneFollowUp() async throws {
+    func testReconnectStatusIsDurableAndSaveFailureDoesNotLeakHeldState() async throws {
+        enum ExpectedFailure: Error { case save }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.importFromGoogleCalendar = true
+        settings.googleAccountEmail = "test@example.com"
+        settings.googleNeedsReconnect = false
+        try context.save()
+        GoogleCalendarService.loadImportAccessToken = {
+            throw GoogleAuthError.needsReconnect
+        }
+        GoogleCalendarService.saveContext = { _ in
+            throw ExpectedFailure.save
+        }
+        defer {
+            GoogleCalendarService.saveContext = { try $0.save() }
+            GoogleCalendarService.loadImportAccessToken = {
+                try await GoogleOAuth.validAccessToken(
+                    urlSession: GoogleCalendarService.urlSession
+                )
+            }
+        }
+
+        let rejected = await GoogleCalendarService.importNow(
+            context: context,
+            settings: settings
+        )
+        XCTAssertEqual(rejected, .failed)
+        XCTAssertFalse(settings.googleNeedsReconnect)
+        var fresh = ModelContext(container)
+        XCTAssertFalse(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        ).googleNeedsReconnect)
+
+        GoogleCalendarService.saveContext = { try $0.save() }
+        let committed = await GoogleCalendarService.importNow(
+            context: context,
+            settings: settings
+        )
+        XCTAssertEqual(committed, .needsReconnect)
+        XCTAssertTrue(settings.googleNeedsReconnect)
+        fresh = ModelContext(container)
+        XCTAssertTrue(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        ).googleNeedsReconnect)
+    }
+
+    @MainActor
+    func testImportMirrorFetchFailureDoesNotAdvanceCursorOrInsert() async throws {
+        try installFakeGoogleToken()
+        let responseData = Data(#"""
+        {
+          "items": [{
+            "id": "new-event",
+            "status": "confirmed",
+            "summary": "Should not be inserted",
+            "start": { "dateTime": "2099-01-01T10:00:00Z" },
+            "end": { "dateTime": "2099-01-01T11:00:00Z" }
+          }],
+          "nextSyncToken": "replacement-token"
+        }
+        """#.utf8)
+        let session = installMockSession { request in
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, responseData)
+        }
+        defer { resetImportTestSeams(session: session) }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.importFromGoogleCalendar = true
+        settings.googleAccountEmail = "test@example.com"
+        settings.googleSyncToken = "original-token"
+        try context.save()
+
+        enum ForcedFailure: Error { case fetch }
+        GoogleCalendarService.loadBusyEvents = { _ in
+            throw ForcedFailure.fetch
+        }
+
+        let result = await GoogleCalendarService.importNow(
+            context: context,
+            settings: settings
+        )
+
+        XCTAssertEqual(result, .failed)
+        XCTAssertEqual(settings.googleSyncToken, "original-token")
+        try context.save()
+        XCTAssertTrue(try googleBusyEvents().isEmpty)
+        XCTAssertEqual(settings.googleSyncToken, "original-token")
+    }
+
+    @MainActor
+    func testImportPruneFetchFailureRollsBackReconciliationAndCursor() async throws {
+        try installFakeGoogleToken()
+        let responseData = Data(#"""
+        {
+          "items": [{
+            "id": "existing",
+            "status": "confirmed",
+            "summary": "Changed upstream",
+            "start": { "dateTime": "2099-01-01T10:00:00Z" },
+            "end": { "dateTime": "2099-01-01T11:00:00Z" }
+          }],
+          "nextSyncToken": "replacement-token"
+        }
+        """#.utf8)
+        let session = installMockSession { request in
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, responseData)
+        }
+        defer { resetImportTestSeams(session: session) }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.importFromGoogleCalendar = true
+        settings.googleAccountEmail = "test@example.com"
+        settings.googleSyncToken = "original-token"
+        context.insert(BusyEvent(
+            source: .googleCalendar,
+            sourceId: "existing",
+            title: "Original",
+            startTime: ISO8601DateFormatter().date(from: "2099-01-01T10:00:00Z")!,
+            endTime: ISO8601DateFormatter().date(from: "2099-01-01T11:00:00Z")!
+        ))
+        try context.save()
+
+        enum ForcedFailure: Error { case fetch }
+        var loadCount = 0
+        GoogleCalendarService.loadBusyEvents = { context in
+            loadCount += 1
+            if loadCount == 2 {
+                throw ForcedFailure.fetch
+            }
+            return try context.fetch(FetchDescriptor<BusyEvent>())
+        }
+
+        let result = await GoogleCalendarService.importNow(
+            context: context,
+            settings: settings
+        )
+
+        XCTAssertEqual(result, .failed)
+        XCTAssertEqual(loadCount, 2)
+        XCTAssertEqual(settings.googleSyncToken, "original-token")
+        try context.save()
+        let imported = try googleBusyEvents()
+        XCTAssertEqual(imported.count, 1)
+        XCTAssertEqual(imported.first?.title, "Original")
+        XCTAssertEqual(settings.googleSyncToken, "original-token")
+    }
+
+    @MainActor
+    func testDisableImportFailureKeepsPreferenceCursorAndMirrorForRetry() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.importFromGoogleCalendar = true
+        settings.googleAccountEmail = "test@example.com"
+        settings.googleSyncToken = "original-token"
+        let existing = BusyEvent(
+            source: .googleCalendar,
+            sourceId: "google-disable-existing",
+            title: "Existing meeting",
+            startTime: Date().addingTimeInterval(3600),
+            endTime: Date().addingTimeInterval(7200)
+        )
+        context.insert(existing)
+        try context.save()
+
+        XCTAssertThrowsError(
+            try GoogleCalendarService.disableImport(
+                settings: settings,
+                context: context,
+                save: { _ in throw ExpectedFailure.save }
+            )
+        )
+
+        XCTAssertTrue(settings.importFromGoogleCalendar)
+        XCTAssertEqual(settings.googleSyncToken, "original-token")
+        XCTAssertEqual(try googleBusyEvents().map(\.id), [existing.id])
+        var fresh = ModelContext(container)
+        var durableSettings = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        XCTAssertTrue(durableSettings.importFromGoogleCalendar)
+        XCTAssertEqual(durableSettings.googleSyncToken, "original-token")
+        XCTAssertEqual(
+            try fresh.fetch(FetchDescriptor<BusyEvent>()).map(\.id),
+            [existing.id]
+        )
+
+        try GoogleCalendarService.disableImport(
+            settings: settings,
+            context: context
+        )
+        fresh = ModelContext(container)
+        durableSettings = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        XCTAssertFalse(durableSettings.importFromGoogleCalendar)
+        XCTAssertNil(durableSettings.googleSyncToken)
+        XCTAssertTrue(try fresh.fetch(FetchDescriptor<BusyEvent>()).isEmpty)
+    }
+
+    @MainActor
+    func testDisconnectFailureKeepsAccountMirrorAndExportIdsForRetry() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.importFromGoogleCalendar = true
+        settings.exportToGoogleCalendar = true
+        settings.googleAccountEmail = "test@example.com"
+        settings.googleSyncToken = "original-token"
+        let existing = BusyEvent(
+            source: .googleCalendar,
+            sourceId: "google-disconnect-existing",
+            title: "Existing meeting",
+            startTime: Date().addingTimeInterval(3600),
+            endTime: Date().addingTimeInterval(7200)
+        )
+        let task = FilumaTask(
+            title: "Exported task",
+            context: .work,
+            deadline: Date().addingTimeInterval(86400),
+            effortMinutes: 30
+        )
+        let block = ScheduledBlock(
+            task: task,
+            startTime: Date().addingTimeInterval(10800),
+            durationMinutes: 30
+        )
+        block.googleCalendarEventId = "google-export-id"
+        context.insert(existing)
+        context.insert(task)
+        context.insert(block)
+        try context.save()
+
+        XCTAssertThrowsError(
+            try GoogleCalendarService.disconnect(
+                settings: settings,
+                context: context,
+                save: { _ in throw ExpectedFailure.save }
+            )
+        )
+
+        XCTAssertTrue(settings.importFromGoogleCalendar)
+        XCTAssertTrue(settings.exportToGoogleCalendar)
+        XCTAssertEqual(settings.googleAccountEmail, "test@example.com")
+        XCTAssertEqual(settings.googleSyncToken, "original-token")
+        XCTAssertEqual(block.googleCalendarEventId, "google-export-id")
+        XCTAssertEqual(try googleBusyEvents().map(\.id), [existing.id])
+        var fresh = ModelContext(container)
+        var durableSettings = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        XCTAssertEqual(durableSettings.googleAccountEmail, "test@example.com")
+        XCTAssertEqual(
+            try XCTUnwrap(fresh.fetch(FetchDescriptor<ScheduledBlock>()).first)
+                .googleCalendarEventId,
+            "google-export-id"
+        )
+
+        try GoogleCalendarService.disconnect(
+            settings: settings,
+            context: context
+        )
+        fresh = ModelContext(container)
+        durableSettings = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        XCTAssertNil(durableSettings.googleAccountEmail)
+        XCTAssertFalse(durableSettings.importFromGoogleCalendar)
+        XCTAssertFalse(durableSettings.exportToGoogleCalendar)
+        XCTAssertTrue(try fresh.fetch(FetchDescriptor<BusyEvent>()).isEmpty)
+        XCTAssertNil(
+            try XCTUnwrap(fresh.fetch(FetchDescriptor<ScheduledBlock>()).first)
+                .googleCalendarEventId
+        )
+    }
+
+    @MainActor
+    func testConnectionPreferenceSaveFailureDoesNotOrphanVisibleAccountState() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        try context.save()
+
+        XCTAssertThrowsError(
+            try GoogleCalendarService.commitConnection(
+                email: "person@example.com",
+                settings: settings,
+                context: context,
+                save: { _ in throw ExpectedFailure.save }
+            )
+        )
+
+        XCTAssertNil(settings.googleAccountEmail)
+        XCTAssertFalse(settings.importFromGoogleCalendar)
+        var fresh = ModelContext(container)
+        var durable = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        XCTAssertNil(durable.googleAccountEmail)
+        XCTAssertFalse(durable.importFromGoogleCalendar)
+
+        try GoogleCalendarService.commitConnection(
+            email: "person@example.com",
+            settings: settings,
+            context: context
+        )
+        fresh = ModelContext(container)
+        durable = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        XCTAssertEqual(durable.googleAccountEmail, "person@example.com")
+        XCTAssertTrue(durable.importFromGoogleCalendar)
+        XCTAssertNil(durable.googleSyncToken)
+    }
+
+    @MainActor
+    func testImportEnablePreferenceSaveFailureKeepsDisabledCursorForRetry() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.googleAccountEmail = "person@example.com"
+        settings.importFromGoogleCalendar = false
+        settings.googleSyncToken = "last-durable-cursor"
+        try context.save()
+
+        XCTAssertThrowsError(
+            try GoogleCalendarService.enableImport(
+                settings: settings,
+                context: context,
+                save: { _ in throw ExpectedFailure.save }
+            )
+        )
+
+        XCTAssertFalse(settings.importFromGoogleCalendar)
+        XCTAssertEqual(settings.googleSyncToken, "last-durable-cursor")
+        var fresh = ModelContext(container)
+        var durable = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        XCTAssertFalse(durable.importFromGoogleCalendar)
+        XCTAssertEqual(durable.googleSyncToken, "last-durable-cursor")
+
+        try GoogleCalendarService.enableImport(
+            settings: settings,
+            context: context
+        )
+        fresh = ModelContext(container)
+        durable = try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        )
+        XCTAssertTrue(durable.importFromGoogleCalendar)
+        XCTAssertNil(durable.googleSyncToken)
+    }
+
+    @MainActor
+    func testExportPreferenceSaveFailureKeepsPriorDurableChoice() throws {
+        enum ExpectedFailure: Error { case save }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.googleAccountEmail = "person@example.com"
+        try context.save()
+
+        XCTAssertThrowsError(
+            try GoogleCalendarService.setExportEnabled(
+                true,
+                settings: settings,
+                context: context,
+                save: { _ in throw ExpectedFailure.save }
+            )
+        )
+        XCTAssertFalse(settings.exportToGoogleCalendar)
+        var fresh = ModelContext(container)
+        XCTAssertFalse(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        ).exportToGoogleCalendar)
+
+        try GoogleCalendarService.setExportEnabled(
+            true,
+            settings: settings,
+            context: context
+        )
+        XCTAssertTrue(settings.exportToGoogleCalendar)
+
+        XCTAssertThrowsError(
+            try GoogleCalendarService.setExportEnabled(
+                false,
+                settings: settings,
+                context: context,
+                save: { _ in throw ExpectedFailure.save }
+            )
+        )
+        XCTAssertTrue(settings.exportToGoogleCalendar)
+        fresh = ModelContext(container)
+        XCTAssertTrue(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        ).exportToGoogleCalendar)
+    }
+
+    @MainActor
+    func testExportFailureCannotRollbackAnUnrelatedSharedContextEdit() async throws {
+        let requestStarted = expectation(description: "export request started")
+        let releaseRequest = DispatchSemaphore(value: 0)
+        let session = installMockSession { request in
+            requestStarted.fulfill()
+            _ = releaseRequest.wait(timeout: .now() + 5)
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 400,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, Data())
+        }
+        GoogleCalendarService.loadExportAccessToken = { "test-access-token" }
+        defer { resetImportTestSeams(session: session) }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.googleAccountEmail = "person@example.com"
+        settings.exportToGoogleCalendar = true
+        let task = FilumaTask(
+            title: "Export boundary",
+            context: .work,
+            deadline: Date().addingTimeInterval(86_400),
+            effortMinutes: 30
+        )
+        let block = ScheduledBlock(
+            task: task,
+            startTime: Date().addingTimeInterval(3_600),
+            durationMinutes: 30
+        )
+        context.insert(task)
+        context.insert(block)
+        try context.save()
+
+        let export = Task {
+            await GoogleCalendarService.exportNow(
+                context: context,
+                settings: settings
+            )
+        }
+        await fulfillment(of: [requestStarted], timeout: 5)
+
+        // This edit deliberately remains pending while the network request is
+        // suspended. Export owns a separate ModelContext, so its failure may
+        // not save or roll this value back.
+        settings.dailyFocusMinutes = 321
+        releaseRequest.signal()
+        let exportResult = await export.value
+        XCTAssertEqual(exportResult, .failed)
+        XCTAssertEqual(settings.dailyFocusMinutes, 321)
+
+        try context.save()
+        let fresh = ModelContext(container)
+        XCTAssertEqual(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        ).dailyFocusMinutes, 321)
+    }
+
+    @MainActor
+    func testDisconnectDuringExportCannotRestoreClearedCalendarIds() async throws {
+        let requestStarted = expectation(description: "export request started")
+        let releaseRequest = DispatchSemaphore(value: 0)
+        let session = installMockSession { request in
+            requestStarted.fulfill()
+            _ = releaseRequest.wait(timeout: .now() + 5)
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, Data(#"{"items":[]}"#.utf8))
+        }
+        GoogleCalendarService.loadExportAccessToken = { "test-access-token" }
+        defer { resetImportTestSeams(session: session) }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.googleAccountEmail = "person@example.com"
+        settings.exportToGoogleCalendar = true
+        let task = FilumaTask(
+            title: "Disconnect export boundary",
+            context: .work,
+            deadline: Date().addingTimeInterval(86_400),
+            effortMinutes: 30
+        )
+        let block = ScheduledBlock(
+            task: task,
+            startTime: Date().addingTimeInterval(3_600),
+            durationMinutes: 30
+        )
+        block.googleCalendarEventId = "old-google-event"
+        context.insert(task)
+        context.insert(block)
+        try context.save()
+
+        let export = Task {
+            await GoogleCalendarService.exportNow(
+                context: context,
+                settings: settings
+            )
+        }
+        await fulfillment(of: [requestStarted], timeout: 5)
+        try GoogleCalendarService.disconnect(
+            settings: settings,
+            context: context
+        )
+        releaseRequest.signal()
+
+        let exportResult = await export.value
+        XCTAssertEqual(exportResult, .cancelled)
+        XCTAssertNil(block.googleCalendarEventId)
+        let fresh = ModelContext(container)
+        XCTAssertNil(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<ScheduledBlock>()).first
+        ).googleCalendarEventId)
+        XCTAssertNil(try XCTUnwrap(
+            fresh.fetch(FetchDescriptor<UserSettings>()).first
+        ).googleAccountEmail)
+    }
+
+    @MainActor
+    func testExportSuccessDurablyCommitsCreatedEventIdFromPrivateContext() async throws {
+        let session = installMockSession { request in
+            let method = request.httpMethod ?? "GET"
+            let data = method == "POST"
+                ? Data(#"{"id":"google-created-event"}"#.utf8)
+                : Data(#"{"items":[]}"#.utf8)
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, data)
+        }
+        GoogleCalendarService.loadExportAccessToken = { "test-access-token" }
+        defer { resetImportTestSeams(session: session) }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.googleAccountEmail = "person@example.com"
+        settings.exportToGoogleCalendar = true
+        let task = FilumaTask(
+            title: "Durable exported event",
+            context: .work,
+            deadline: Date().addingTimeInterval(86_400),
+            effortMinutes: 30
+        )
+        let block = ScheduledBlock(
+            task: task,
+            startTime: Date().addingTimeInterval(3_600),
+            durationMinutes: 30
+        )
+        context.insert(task)
+        context.insert(block)
+        try context.save()
+
+        let result = await GoogleCalendarService.exportNow(
+            context: context,
+            settings: settings
+        )
+
+        XCTAssertEqual(result, .success)
+        let fresh = ModelContext(container)
+        XCTAssertEqual(
+            try XCTUnwrap(fresh.fetch(FetchDescriptor<ScheduledBlock>()).first)
+                .googleCalendarEventId,
+            "google-created-event"
+        )
+    }
+
+    @MainActor
+    func testExportPrivateContextSaveFailureLeavesDurableEventIdUnchanged() async throws {
+        enum ForcedFailure: Error { case save }
+
+        let requestLock = NSLock()
+        var postedEvent = false
+        let session = installMockSession { request in
+            let method = request.httpMethod ?? "GET"
+            if method == "POST" {
+                requestLock.withLock { postedEvent = true }
+            }
+            let data = method == "POST"
+                ? Data(#"{"id":"remote-event-without-local-commit"}"#.utf8)
+                : Data(#"{"items":[]}"#.utf8)
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, data)
+        }
+        GoogleCalendarService.loadExportAccessToken = { "test-access-token" }
+        defer { resetImportTestSeams(session: session) }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.googleAccountEmail = "person@example.com"
+        settings.exportToGoogleCalendar = true
+        let task = FilumaTask(
+            title: "Rejected export bookkeeping",
+            context: .work,
+            deadline: Date().addingTimeInterval(86_400),
+            effortMinutes: 30
+        )
+        let block = ScheduledBlock(
+            task: task,
+            startTime: Date().addingTimeInterval(3_600),
+            durationMinutes: 30
+        )
+        context.insert(task)
+        context.insert(block)
+        try context.save()
+
+        let sharedContext = context!
+        GoogleCalendarService.saveContext = { saveContext in
+            XCTAssertFalse(
+                saveContext === sharedContext,
+                "Export must never save the shared UI context after a network suspension"
+            )
+            throw ForcedFailure.save
+        }
+
+        let result = await GoogleCalendarService.exportNow(
+            context: context,
+            settings: settings
+        )
+
+        XCTAssertEqual(result, .failed)
+        XCTAssertTrue(requestLock.withLock { postedEvent })
+        XCTAssertNil(block.googleCalendarEventId)
+        let fresh = ModelContext(container)
+        XCTAssertNil(
+            try XCTUnwrap(fresh.fetch(FetchDescriptor<ScheduledBlock>()).first)
+                .googleCalendarEventId
+        )
+    }
+
+    @MainActor
+    func testQueuedExportAwaitsFollowUpFailureInsteadOfQueuedPlaceholder() async throws {
+        let firstRequestStarted = expectation(description: "first export request started")
+        let releaseFirstRequest = DispatchSemaphore(value: 0)
+        let requestLock = NSLock()
+        var requestCount = 0
+        let session = installMockSession { request in
+            let currentRequest = requestLock.withLock {
+                requestCount += 1
+                return requestCount
+            }
+            if currentRequest == 1 {
+                firstRequestStarted.fulfill()
+                releaseFirstRequest.wait()
+            }
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: currentRequest == 1 ? 200 : 400,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            let data = currentRequest == 1
+                ? Data(#"{"items":[]}"#.utf8)
+                : Data()
+            return (response, data)
+        }
+        GoogleCalendarService.loadExportAccessToken = { "test-access-token" }
+        defer { resetImportTestSeams(session: session) }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.googleAccountEmail = "person@example.com"
+        settings.exportToGoogleCalendar = true
+        try context.save()
+
+        let firstExport = Task { @MainActor in
+            await GoogleCalendarService.exportNow(
+                context: context,
+                settings: settings
+            )
+        }
+        await fulfillment(of: [firstRequestStarted], timeout: 2)
+        let queuedExport = Task { @MainActor in
+            await GoogleCalendarService.exportNow(
+                context: context,
+                settings: settings
+            )
+        }
+        await Task.yield()
+        releaseFirstRequest.signal()
+
+        let firstResult = await firstExport.value
+        let queuedResult = await queuedExport.value
+        XCTAssertEqual(firstResult, .success)
+        XCTAssertEqual(queuedResult, .failed)
+        XCTAssertEqual(requestLock.withLock { requestCount }, 2)
+    }
+
+    @MainActor
+    func testCancelledOldExportStillDrainsNewGenerationQueuedRequest() async throws {
+        let firstRequestStarted = expectation(description: "old export request started")
+        let releaseFirstRequest = DispatchSemaphore(value: 0)
+        let requestLock = NSLock()
+        var requestCount = 0
+        let session = installMockSession { request in
+            let currentRequest = requestLock.withLock {
+                requestCount += 1
+                return requestCount
+            }
+            if currentRequest == 1 {
+                firstRequestStarted.fulfill()
+                releaseFirstRequest.wait()
+            }
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, Data(#"{"items":[]}"#.utf8))
+        }
+        GoogleCalendarService.loadExportAccessToken = { "test-access-token" }
+        defer { resetImportTestSeams(session: session) }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.googleAccountEmail = "person@example.com"
+        settings.exportToGoogleCalendar = true
+        try context.save()
+
+        let oldExport = Task { @MainActor in
+            await GoogleCalendarService.exportNow(
+                context: context,
+                settings: settings
+            )
+        }
+        await fulfillment(of: [firstRequestStarted], timeout: 2)
+
+        // Turning export off invalidates the suspended generation. Turning it
+        // back on creates a valid new request which must survive even if the
+        // old caller task itself is cancelled while draining the queue.
+        try GoogleCalendarService.setExportEnabled(
+            false,
+            settings: settings,
+            context: context
+        )
+        try GoogleCalendarService.setExportEnabled(
+            true,
+            settings: settings,
+            context: context
+        )
+        let liveExport = Task { @MainActor in
+            await GoogleCalendarService.exportNow(
+                context: context,
+                settings: settings
+            )
+        }
+        await Task.yield()
+        oldExport.cancel()
+        releaseFirstRequest.signal()
+
+        let oldResult = await oldExport.value
+        let liveResult = await liveExport.value
+        XCTAssertEqual(oldResult, .cancelled)
+        XCTAssertEqual(liveResult, .success)
+        XCTAssertEqual(requestLock.withLock { requestCount }, 2)
+    }
+
+    @MainActor
+    func testConcurrentImportsCoalesceAndAwaitOneFollowUpTerminalResult() async throws {
         try installFakeGoogleToken()
         let firstRequestStarted = expectation(description: "first import request started")
         let secondRequestStarted = expectation(description: "queued import request started")
@@ -362,19 +1163,222 @@ final class GoogleCalendarTests: XCTestCase {
         }
         await fulfillment(of: [firstRequestStarted], timeout: 2)
 
-        await GoogleCalendarService.importNow(context: context, settings: settings)
-        releaseFirstRequest.signal()
-        await firstImport.value
-        await fulfillment(of: [secondRequestStarted], timeout: 2)
-
-        let deadline = Date().addingTimeInterval(2)
-        while settings.googleSyncToken != "sync-2", Date() < deadline {
-            try await Task.sleep(for: .milliseconds(10))
+        let queuedImportA = Task { @MainActor in
+            await GoogleCalendarService.importNow(context: context, settings: settings)
         }
+        let queuedImportB = Task { @MainActor in
+            await GoogleCalendarService.importNow(context: context, settings: settings)
+        }
+        // Both tasks run to their continuation before the first transport is
+        // released, deterministically exercising the coalescing path.
+        await Task.yield()
+        await Task.yield()
+        releaseFirstRequest.signal()
+
+        let firstResult = await firstImport.value
+        XCTAssertEqual(firstResult, .success)
+        await fulfillment(of: [secondRequestStarted], timeout: 2)
+        let queuedResultA = await queuedImportA.value
+        let queuedResultB = await queuedImportB.value
 
         let finalRequestCount = requestLock.withLock { requestCount }
         XCTAssertEqual(finalRequestCount, 2, "Concurrent requests should coalesce to one follow-up")
+        XCTAssertEqual(queuedResultA, .success)
+        XCTAssertEqual(queuedResultB, .success)
         XCTAssertEqual(settings.googleSyncToken, "sync-2", "The queued import should finish")
+    }
+
+    @MainActor
+    func testQueuedImportReturnsFollowUpFailureInsteadOfQueuedPlaceholder() async throws {
+        try installFakeGoogleToken()
+        let firstRequestStarted = expectation(description: "first import request started")
+        let releaseFirstRequest = DispatchSemaphore(value: 0)
+        let requestLock = NSLock()
+        var requestCount = 0
+        let session = installMockSession { request in
+            let currentRequest = requestLock.withLock {
+                requestCount += 1
+                return requestCount
+            }
+            if currentRequest == 1 {
+                firstRequestStarted.fulfill()
+                releaseFirstRequest.wait()
+            }
+
+            let status = currentRequest == 1 ? 200 : 400
+            let data = currentRequest == 1
+                ? Data(#"{"items":[],"nextSyncToken":"sync-1"}"#.utf8)
+                : Data()
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: status,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, data)
+        }
+        defer { resetImportTestSeams(session: session) }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.importFromGoogleCalendar = true
+        settings.googleAccountEmail = "test@example.com"
+        try context.save()
+
+        let firstImport = Task { @MainActor in
+            await GoogleCalendarService.importNow(context: context, settings: settings)
+        }
+        await fulfillment(of: [firstRequestStarted], timeout: 2)
+        let queuedImport = Task { @MainActor in
+            await GoogleCalendarService.importNow(context: context, settings: settings)
+        }
+        await Task.yield()
+        releaseFirstRequest.signal()
+
+        let firstResult = await firstImport.value
+        let queuedResult = await queuedImport.value
+        XCTAssertEqual(firstResult, .success)
+        XCTAssertEqual(queuedResult, .failed)
+        XCTAssertEqual(requestLock.withLock { requestCount }, 2)
+        XCTAssertEqual(settings.googleSyncToken, "sync-1")
+    }
+
+    @MainActor
+    func testQueuedImportUsesRequestingContextAndSettings() async throws {
+        try installFakeGoogleToken()
+        let firstRequestStarted = expectation(description: "first context import started")
+        let releaseFirstRequest = DispatchSemaphore(value: 0)
+        let requestLock = NSLock()
+        var requestCount = 0
+        let session = installMockSession { request in
+            let currentRequest = requestLock.withLock {
+                requestCount += 1
+                return requestCount
+            }
+            if currentRequest == 1 {
+                firstRequestStarted.fulfill()
+                releaseFirstRequest.wait()
+            }
+            let data = Data(
+                "{\"items\":[],\"nextSyncToken\":\"context-\(currentRequest)\"}".utf8
+            )
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, data)
+        }
+        defer { resetImportTestSeams(session: session) }
+
+        let firstSettings = UserSettings.fetchOrCreate(in: context)
+        firstSettings.importFromGoogleCalendar = true
+        firstSettings.googleAccountEmail = "first@example.com"
+        try context.save()
+
+        let secondContainer = try ModelContainer(
+            for: SharedStore.schema,
+            configurations: [ModelConfiguration(isStoredInMemoryOnly: true)]
+        )
+        let secondContext = ModelContext(secondContainer)
+        let secondSettings = UserSettings.fetchOrCreate(in: secondContext)
+        secondSettings.importFromGoogleCalendar = true
+        secondSettings.googleAccountEmail = "second@example.com"
+        try secondContext.save()
+
+        let firstImport = Task { @MainActor in
+            await GoogleCalendarService.importNow(
+                context: context,
+                settings: firstSettings
+            )
+        }
+        await fulfillment(of: [firstRequestStarted], timeout: 2)
+        let secondImport = Task { @MainActor in
+            await GoogleCalendarService.importNow(
+                context: secondContext,
+                settings: secondSettings
+            )
+        }
+        await Task.yield()
+        releaseFirstRequest.signal()
+
+        let firstResult = await firstImport.value
+        let secondResult = await secondImport.value
+        XCTAssertEqual(firstResult, .success)
+        XCTAssertEqual(secondResult, .success)
+        XCTAssertEqual(requestLock.withLock { requestCount }, 2)
+        XCTAssertEqual(firstSettings.googleSyncToken, "context-1")
+        XCTAssertEqual(secondSettings.googleSyncToken, "context-2")
+    }
+
+    @MainActor
+    func testInFlightImportInvalidatedByDisableReturnsCancelledNotFailure() async throws {
+        try installFakeGoogleToken()
+        let requestStarted = expectation(description: "import request started")
+        let releaseRequest = DispatchSemaphore(value: 0)
+        let session = installMockSession { request in
+            requestStarted.fulfill()
+            releaseRequest.wait()
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 400,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, Data())
+        }
+        defer { resetImportTestSeams(session: session) }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.importFromGoogleCalendar = true
+        settings.googleAccountEmail = "test@example.com"
+        try context.save()
+
+        let importTask = Task { @MainActor in
+            await GoogleCalendarService.importNow(context: context, settings: settings)
+        }
+        await fulfillment(of: [requestStarted], timeout: 2)
+        try GoogleCalendarService.disableImport(settings: settings, context: context)
+        releaseRequest.signal()
+
+        let result = await importTask.value
+        XCTAssertEqual(result, .cancelled)
+        XCTAssertFalse(settings.importFromGoogleCalendar)
+    }
+
+    @MainActor
+    func testInFlightImportInvalidatedByDisconnectReturnsCancelledNotFailure() async throws {
+        try installFakeGoogleToken()
+        let requestStarted = expectation(description: "import request started")
+        let releaseRequest = DispatchSemaphore(value: 0)
+        let session = installMockSession { request in
+            requestStarted.fulfill()
+            releaseRequest.wait()
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 400,
+                httpVersion: nil,
+                headerFields: nil
+            )!
+            return (response, Data())
+        }
+        defer { resetImportTestSeams(session: session) }
+
+        let settings = UserSettings.fetchOrCreate(in: context)
+        settings.importFromGoogleCalendar = true
+        settings.googleAccountEmail = "test@example.com"
+        try context.save()
+
+        let importTask = Task { @MainActor in
+            await GoogleCalendarService.importNow(context: context, settings: settings)
+        }
+        await fulfillment(of: [requestStarted], timeout: 2)
+        try GoogleCalendarService.disconnect(settings: settings, context: context)
+        releaseRequest.signal()
+
+        let result = await importTask.value
+        XCTAssertEqual(result, .cancelled)
+        XCTAssertNil(settings.googleAccountEmail)
     }
 
     // MARK: - Wire decoding

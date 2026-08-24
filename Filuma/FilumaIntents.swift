@@ -23,53 +23,67 @@ struct CaptureTaskIntent: AppIntent {
 
     @MainActor
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        let trimmed = taskTitle.trimmingCharacters(in: .whitespaces)
+        let trimmed = taskTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             return .result(dialog: "Nothing captured — the task needs a name.")
         }
 
         let container = try SharedStore.makeContainer()
         let context = ModelContext(container)
-        let settings = UserSettings.fetchOrCreate(in: context)
-
+        let now = Date()
         let deadline = Calendar.current.date(
             byAdding: .day,
             value: daysUntilDue,
-            to: Date()
-        ) ?? Date()
-        let task = FilumaTask(
-            title: trimmed,
-            context: .personal,
-            deadline: deadline,
-            effortMinutes: 60
-        )
-        context.insert(task)
+            to: now
+        ) ?? now
 
-        let allBlocks = (try? context.fetch(FetchDescriptor<ScheduledBlock>())) ?? []
-        let blockedTimes = (try? context.fetch(FetchDescriptor<BlockedTime>())) ?? []
-        let busyEvents = (try? context.fetch(FetchDescriptor<BusyEvent>())) ?? []
-
-        let result = SchedulerService.schedule(
-            task: task,
-            allBlocks: allBlocks,
-            blockedTimes: blockedTimes,
-            busyEvents: busyEvents,
-            settings: settings,
-            from: Date().addingTimeInterval(TimeInterval(settings.startBufferMinutes * 60))
-        )
-        SchedulerService.insert(result: result, into: context)
-        try context.save()
-        PlanCoordinator.publishChange(context: context, interactive: false)
-
-        switch result {
-        case .success(let blocks), .partialFit(let blocks, _):
-            if let first = blocks.min(by: { $0.startTime < $1.startTime }) {
-                return .result(dialog: "Captured. First block \(Self.relative(first.startTime)).")
-            }
-            return .result(dialog: "Captured and scheduled.")
-        case .noSlots:
-            return .result(dialog: "Captured, but nothing fits before the deadline — open Filuma to make room.")
+        let receipt: TaskCaptureReceipt
+        do {
+            let prepared = try CaptureCoordinator.prepareTask(
+                title: trimmed,
+                firstStep: "",
+                taskContext: .personal,
+                deadline: deadline,
+                effortMinutes: 60,
+                now: now,
+                context: context
+            )
+            receipt = try CaptureCoordinator.commit(
+                prepared,
+                context: context,
+                publish: { context, _ in
+                    PlanCoordinator.publishChange(
+                        context: context,
+                        interactive: false
+                    )
+                }
+            )
+        } catch CaptureCoordinatorError.missingSettings {
+            return .result(
+                dialog: "Open Filuma once to finish setup, then I can place this task in your plan."
+            )
+        } catch {
+            return .result(
+                dialog: "I couldn't save that task yet. Nothing was added — please try again."
+            )
         }
+
+        if let firstBlockStart = receipt.firstBlockStart {
+            if receipt.unscheduledMinutes > 0 {
+                let remaining = CountdownFormatter.effortString(
+                    minutes: receipt.unscheduledMinutes
+                )
+                return .result(
+                    dialog: "Captured. First block \(Self.relative(firstBlockStart)); \(remaining) still needs time."
+                )
+            }
+            return .result(
+                dialog: "Captured. First block \(Self.relative(firstBlockStart))."
+            )
+        }
+        return .result(
+            dialog: "Captured, but nothing fits before the deadline — open Filuma to make room."
+        )
     }
 
     private static func relative(_ date: Date) -> String {

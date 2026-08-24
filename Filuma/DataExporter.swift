@@ -1,20 +1,54 @@
 import Foundation
 import SwiftData
 
-/// Everything Filuma knows, as portable JSON. A trust feature: the plan, the
-/// history, and the settings are the user's — exportable any time, readable
-/// by anything. Also doubles as a manual backup.
+/// The user's portable Filuma record as JSON. A trust feature: authored plan,
+/// history, reminders, blocked time, and settings are exportable any time and
+/// readable by anything. Imported calendar copies and authentication secrets
+/// are deliberately not a backup payload.
 enum DataExporter {
 
     struct Export: Codable {
-        var version = 2
+        var version = 4
         var exportedAt = Date()
+        var settings: SettingsRecord?
         var tasks: [TaskRecord] = []
         var templates: [TemplateRecord] = []
         var blocks: [BlockRecord] = []
         var workSessions: [SessionRecord] = []
         var reminders: [ReminderRecord] = []
         var blockedTimes: [BlockedTimeRecord] = []
+    }
+
+    /// User-authored preferences and connection state. OAuth credentials and
+    /// opaque sync cursors are deliberately excluded: an honest portable
+    /// export should describe the user's choices without copying secrets.
+    struct SettingsRecord: Codable {
+        let id: UUID
+        let wakeHour: Int
+        let wakeMinute: Int
+        let sleepHour: Int
+        let sleepMinute: Int
+        let minBlockMinutes: Int
+        let maxBlockMinutes: Int
+        let deadlineBufferMinutes: Int
+        let startBufferMinutes: Int
+        let dailyFocusMinutes: Int
+        let planningRebuildPending: Bool
+        let exportToAppleCalendar: Bool
+        let importFromAppleCalendar: Bool
+        let excludedCalendarIds: [String]
+        let importFromGoogleCalendar: Bool
+        let exportToGoogleCalendar: Bool
+        let googleAccountEmail: String?
+        let googleNeedsReconnect: Bool
+        let hasCompletedOnboarding: Bool
+        let blockRemindersEnabled: Bool
+        let blockReminderLeadMinutes: Int
+        let morningPreviewEnabled: Bool
+        let eveningReviewEnabled: Bool
+        let eveningReviewHour: Int
+        let eveningReviewMinute: Int
+        let hearthAccent: String
     }
 
     struct TaskRecord: Codable {
@@ -76,6 +110,37 @@ enum DataExporter {
 
     static func exportJSON(context: ModelContext) throws -> Data {
         var export = Export()
+
+        if let settings = try context.fetch(FetchDescriptor<UserSettings>()).first {
+            export.settings = SettingsRecord(
+                id: settings.id,
+                wakeHour: settings.wakeHour,
+                wakeMinute: settings.wakeMinute,
+                sleepHour: settings.sleepHour,
+                sleepMinute: settings.sleepMinute,
+                minBlockMinutes: settings.minBlockMinutes,
+                maxBlockMinutes: settings.maxBlockMinutes,
+                deadlineBufferMinutes: settings.deadlineBufferMinutes,
+                startBufferMinutes: settings.startBufferMinutes,
+                dailyFocusMinutes: settings.dailyFocusMinutes,
+                planningRebuildPending: settings.planningRebuildPending,
+                exportToAppleCalendar: settings.exportToAppleCalendar,
+                importFromAppleCalendar: settings.importFromAppleCalendar,
+                excludedCalendarIds: settings.excludedCalendarIds,
+                importFromGoogleCalendar: settings.importFromGoogleCalendar,
+                exportToGoogleCalendar: settings.exportToGoogleCalendar,
+                googleAccountEmail: settings.googleAccountEmail,
+                googleNeedsReconnect: settings.googleNeedsReconnect,
+                hasCompletedOnboarding: settings.hasCompletedOnboarding,
+                blockRemindersEnabled: settings.blockRemindersEnabled,
+                blockReminderLeadMinutes: settings.blockReminderLeadMinutes,
+                morningPreviewEnabled: settings.morningPreviewEnabled,
+                eveningReviewEnabled: settings.eveningReviewEnabled,
+                eveningReviewHour: settings.eveningReviewHour,
+                eveningReviewMinute: settings.eveningReviewMinute,
+                hearthAccent: HearthAccent.current.rawValue
+            )
+        }
 
         export.tasks = try context.fetch(FetchDescriptor<FilumaTask>()).map { task in
             TaskRecord(

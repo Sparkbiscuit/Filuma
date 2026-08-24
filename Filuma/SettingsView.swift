@@ -1,10 +1,38 @@
 import SwiftUI
 import SwiftData
 import EventKit
+import UIKit
 
 struct SettingsView: View {
+    private enum CalendarSettingRetry: Equatable {
+        case setAppleExport(Bool)
+        case reconcileAppleExport(Bool)
+    }
+
+    private enum GoogleSyncOperation: Equatable {
+        case importBusyTimes
+        case exportBlocks
+
+        var retryLabel: String {
+            switch self {
+            case .importBusyTimes: "Retry Google import"
+            case .exportBlocks: "Retry Google export"
+            }
+        }
+
+        var failureAnnouncement: String {
+            switch self {
+            case .importBusyTimes:
+                "Google Calendar couldn't refresh busy times. Your preference is still on; retry when you're ready."
+            case .exportBlocks:
+                "Google Calendar couldn't refresh exported blocks. Your preference is still on; retry when you're ready."
+            }
+        }
+    }
+
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Query private var settingsArray: [UserSettings]
     @State private var showCalendarDeniedAlert = false
     @State private var showNotificationsDeniedAlert = false
@@ -13,9 +41,19 @@ struct SettingsView: View {
     @State private var exportFileURL: URL?
     @State private var isConnectingGoogle = false
     @State private var showGoogleConnectFailed = false
+    @State private var showExportFailed = false
+    @State private var googleSyncIssue: GoogleSyncOperation?
+    @State private var googleSyncInFlight: GoogleSyncOperation?
+    @State private var googleSyncRequestID: UUID?
+    @State private var googleSyncTask: Task<Void, Never>?
     @State private var confirmGoogleDisconnect = false
     @State private var planningPreferencesDirty = false
     @State private var planningRebuildTask: Task<Void, Never>?
+    @State private var showPlanningRefreshFailed = false
+    @State private var calendarSettingIssue: String?
+    @State private var calendarSettingRetry: CalendarSettingRetry?
+    @State private var notificationSettingIssue: BlockNotificationService.PreferenceUpdate?
+    @State private var appleExportRequestID: UUID?
 
     var body: some View {
         NavigationStack {
@@ -40,10 +78,7 @@ struct SettingsView: View {
     private func settingsList(_ settings: UserSettings) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                HearthTitle(text: "Settings", size: 28)
-                    .padding(.horizontal, 20)
-                    .padding(.top, 16)
-                    .padding(.bottom, 18)
+                settingsHeader
 
                 hearthSection
                 dailyScheduleSection(settings)
@@ -65,12 +100,14 @@ struct SettingsView: View {
         }
         .hearthScreen(topGlow: 0.18, bottomGlow: 0.24)
         .alert("Calendar access needed", isPresented: $showCalendarDeniedAlert) {
-            Button("OK", role: .cancel) {}
+            Button("Open System Settings", action: openSystemSettings)
+            Button("Not now", role: .cancel) {}
         } message: {
-            Text("Enable calendar access for Filuma in Settings to export your work blocks.")
+            Text("Enable calendar access so Filuma can schedule around your events and, if you choose, export work blocks.")
         }
         .alert("Notifications are off", isPresented: $showNotificationsDeniedAlert) {
-            Button("OK", role: .cancel) {}
+            Button("Open System Settings", action: openSystemSettings)
+            Button("Not now", role: .cancel) {}
         } message: {
             Text("Enable notifications for Filuma in Settings to get block start nudges.")
         }
@@ -79,29 +116,109 @@ struct SettingsView: View {
         } message: {
             Text("Something went wrong signing in to Google. Check your connection and try again.")
         }
+        .alert("Couldn't create the export", isPresented: $showExportFailed) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Your data is still safe in Filuma. Try Export my data again in a moment.")
+        }
+        .alert("Plan not refreshed yet", isPresented: $showPlanningRefreshFailed) {
+            Button("Retry") {
+                performPlanningRebuild()
+            }
+            Button("Not now", role: .cancel) { }
+        } message: {
+            Text("Your preference is still here, but Filuma couldn’t safely rebuild the plan yet. The existing schedule is unchanged; retry when you’re ready.")
+        }
+        .alert(
+            "Calendar needs attention",
+            isPresented: Binding(
+                get: { calendarSettingIssue != nil },
+                set: {
+                    if !$0 {
+                        calendarSettingIssue = nil
+                        calendarSettingRetry = nil
+                    }
+                }
+            )
+        ) {
+            if let retry = calendarSettingRetry {
+                Button("Retry") {
+                    calendarSettingIssue = nil
+                    calendarSettingRetry = nil
+                    Task { @MainActor in
+                        await Task.yield()
+                        retryCalendarSetting(retry, settings: settings)
+                    }
+                }
+            }
+            Button("Not now", role: .cancel) {
+                calendarSettingIssue = nil
+                calendarSettingRetry = nil
+            }
+        } message: {
+            Text(calendarSettingIssue ?? "")
+        }
+        .alert(
+            "Notification setting not changed",
+            isPresented: Binding(
+                get: { notificationSettingIssue != nil },
+                set: { if !$0 { notificationSettingIssue = nil } }
+            )
+        ) {
+            if let update = notificationSettingIssue {
+                Button("Retry") {
+                    notificationSettingIssue = nil
+                    Task { @MainActor in
+                        await Task.yield()
+                        setNotificationPreference(update, settings: settings)
+                    }
+                }
+            }
+            Button("Not now", role: .cancel) {
+                notificationSettingIssue = nil
+            }
+        } message: {
+            Text(notificationSettingIssue?.failureMessage ?? "")
+        }
     }
 
     // MARK: - Hearth (accent hue)
 
+    private var settingsHeader: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("Your space")
+                .font(AppFont.heading(12))
+                .foregroundStyle(Color.brand300)
+
+            HearthTitle(text: "Settings", size: 28)
+                .accessibilityAddTraits(.isHeader)
+
+            Text("Shape the plan around the way your days actually work.")
+                .font(AppFont.body(13))
+                .foregroundStyle(Color.filumaSubtle)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, FilumaSpacing.screen)
+        .padding(.top, 16)
+        .padding(.bottom, 16)
+    }
+
     /// The hearth itself: which color the flame burns. Every glow, ring,
     /// ember, and gradient in the app follows this choice live.
     private var hearthSection: some View {
-        SettingsGroup(title: "Hearth", footer: "The color your hearth burns. Everything warm follows it.") {
-            SettingsRow(icon: "flame.fill", tint: .brand500, label: "Flame") {
-                HStack(spacing: 2) {
-                    ForEach(HearthAccent.allCases) { accent in
-                        AccentSwatch(
-                            accent: accent,
-                            isSelected: HearthTheme.shared.accent == accent
-                        ) {
-                            withAnimation(.easeInOut(duration: 0.35)) {
-                                HearthTheme.shared.accent = accent
-                            }
-                        }
-                    }
-                }
+        HearthAccentPanel(selectedAccent: HearthTheme.shared.accent) { accent in
+            guard HearthTheme.shared.accent != accent else { return }
+            UISelectionFeedbackGenerator().selectionChanged()
+            withAnimation(reduceMotion ? HearthMotion.reduced : HearthMotion.selection) {
+                HearthTheme.shared.accent = accent
             }
+            UIAccessibility.post(
+                notification: .announcement,
+                argument: "\(accent.displayName) hearth selected."
+            )
         }
+        .padding(.horizontal, FilumaSpacing.screen)
+        .padding(.bottom, 22)
     }
 
     // MARK: - Daily Schedule
@@ -114,10 +231,12 @@ struct SettingsView: View {
             SettingsRow(icon: "sunrise.fill", tint: .workDisplay, label: "Wake time") {
                 timePicker(
                     hour: planningPreferenceBinding(
+                        settings: settings,
                         get: { settings.wakeHour },
                         set: { settings.wakeHour = $0 }
                     ),
                     minute: planningPreferenceBinding(
+                        settings: settings,
                         get: { settings.wakeMinute },
                         set: { settings.wakeMinute = $0 }
                     )
@@ -127,10 +246,12 @@ struct SettingsView: View {
             SettingsRow(icon: "moon.fill", tint: .schoolDisplay, label: "Sleep time") {
                 timePicker(
                     hour: planningPreferenceBinding(
+                        settings: settings,
                         get: { settings.sleepHour },
                         set: { settings.sleepHour = $0 }
                     ),
                     minute: planningPreferenceBinding(
+                        settings: settings,
                         get: { settings.sleepMinute },
                         set: { settings.sleepMinute = $0 }
                     )
@@ -157,6 +278,9 @@ struct SettingsView: View {
 
         return DatePicker("", selection: date, displayedComponents: .hourAndMinute)
             .labelsHidden()
+            .fixedSize(horizontal: true, vertical: false)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
     }
 
     // MARK: - Planning
@@ -169,6 +293,7 @@ struct SettingsView: View {
             stepperRow(
                 icon: "gauge.with.needle", tint: .brand300, label: "Daily focus limit",
                 value: planningPreferenceBinding(
+                    settings: settings,
                     get: { settings.dailyFocusMinutes },
                     set: { settings.dailyFocusMinutes = $0 }
                 ),
@@ -180,6 +305,7 @@ struct SettingsView: View {
             stepperRow(
                 icon: "rectangle.compress.vertical", tint: .schoolDisplay, label: "Minimum block",
                 value: planningPreferenceBinding(
+                    settings: settings,
                     get: { settings.minBlockMinutes },
                     set: { settings.minBlockMinutes = $0 }
                 ),
@@ -189,6 +315,7 @@ struct SettingsView: View {
             stepperRow(
                 icon: "rectangle.expand.vertical", tint: .schoolDisplay, label: "Maximum block",
                 value: planningPreferenceBinding(
+                    settings: settings,
                     get: { settings.maxBlockMinutes },
                     set: { settings.maxBlockMinutes = $0 }
                 ),
@@ -198,6 +325,7 @@ struct SettingsView: View {
             stepperRow(
                 icon: "shield.fill", tint: .personalDisplay, label: "Deadline buffer",
                 value: planningPreferenceBinding(
+                    settings: settings,
                     get: { settings.deadlineBufferMinutes },
                     set: { settings.deadlineBufferMinutes = $0 }
                 ),
@@ -207,6 +335,7 @@ struct SettingsView: View {
             stepperRow(
                 icon: "hourglass.bottomhalf.filled", tint: .personalDisplay, label: "Start buffer",
                 value: planningPreferenceBinding(
+                    settings: settings,
                     get: { settings.startBufferMinutes },
                     set: { settings.startBufferMinutes = $0 }
                 ),
@@ -239,7 +368,9 @@ struct SettingsView: View {
                     .accessibilityHidden(true)
                 Stepper("", value: value, in: range, step: step)
                     .labelsHidden()
-                    .fixedSize()
+                    .fixedSize(horizontal: true, vertical: false)
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
                     .accessibilityLabel(label)
                     .accessibilityValue(display)
             }
@@ -250,6 +381,7 @@ struct SettingsView: View {
     /// moving. A single trailing rebuild keeps those edits responsive while
     /// still committing the final preference promptly.
     private func planningPreferenceBinding(
+        settings: UserSettings,
         get: @escaping () -> Int,
         set: @escaping (Int) -> Void
     ) -> Binding<Int> {
@@ -258,6 +390,7 @@ struct SettingsView: View {
             set: { newValue in
                 guard newValue != get() else { return }
                 set(newValue)
+                settings.planningRebuildPending = true
                 queuePlanningRebuild()
             }
         )
@@ -274,18 +407,31 @@ struct SettingsView: View {
             }
             guard !Task.isCancelled else { return }
             planningRebuildTask = nil
-            guard planningPreferencesDirty else { return }
-            planningPreferencesDirty = false
-            PlanCoordinator.rebuildAfterPlanningPreferencesChange(context: modelContext)
+            performPlanningRebuild()
         }
     }
 
     private func flushPlanningRebuild() {
         planningRebuildTask?.cancel()
         planningRebuildTask = nil
+        performPlanningRebuild()
+    }
+
+    private func performPlanningRebuild() {
         guard planningPreferencesDirty else { return }
-        planningPreferencesDirty = false
-        PlanCoordinator.rebuildAfterPlanningPreferencesChange(context: modelContext)
+        do {
+            try PlanCoordinator.rebuildAfterPlanningPreferencesChange(
+                context: modelContext
+            )
+            planningPreferencesDirty = false
+            showPlanningRefreshFailed = false
+        } catch {
+            // Keep the dirty bit as a durable retry intent. The coordinator
+            // leaves the old plan untouched and publishes nothing.
+            planningPreferencesDirty = true
+            showPlanningRefreshFailed = true
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+        }
     }
 
     // MARK: - Nudges
@@ -309,9 +455,11 @@ struct SettingsView: View {
                     icon: "clock.badge", tint: .brand300, label: "Early heads-up",
                     value: Binding(
                         get: { settings.blockReminderLeadMinutes },
-                        set: {
-                            settings.blockReminderLeadMinutes = $0
-                            BlockNotificationService.resync(context: modelContext)
+                        set: { minutes in
+                            setNotificationPreference(
+                                .blockReminderLeadMinutes(minutes),
+                                settings: settings
+                            )
                         }
                     ),
                     range: 0...15, step: 5,
@@ -323,8 +471,9 @@ struct SettingsView: View {
 
             SettingsRow(icon: "sun.horizon.fill", tint: .workDisplay, label: "Morning preview") {
                 Toggle("Morning preview", isOn: notificationToggleBinding(
+                    settings: settings,
                     get: { settings.morningPreviewEnabled },
-                    set: { settings.morningPreviewEnabled = $0 }
+                    update: { .morningPreviewEnabled($0) }
                 ))
                 .labelsHidden()
                 .toggleStyle(HearthToggleStyle())
@@ -332,8 +481,9 @@ struct SettingsView: View {
 
             SettingsRow(icon: "moon.stars.fill", tint: .schoolDisplay, label: "Evening wrap-up") {
                 Toggle("Evening wrap-up", isOn: notificationToggleBinding(
+                    settings: settings,
                     get: { settings.eveningReviewEnabled },
-                    set: { settings.eveningReviewEnabled = $0 }
+                    update: { .eveningReviewEnabled($0) }
                 ))
                 .labelsHidden()
                 .toggleStyle(HearthToggleStyle())
@@ -341,72 +491,95 @@ struct SettingsView: View {
 
             if settings.eveningReviewEnabled {
                 SettingsRow(icon: "clock.fill", tint: .filumaSubtle, label: "Wrap-up time") {
-                    timePicker(
-                        hour: Binding(
-                            get: { settings.eveningReviewHour },
-                            set: {
-                                settings.eveningReviewHour = $0
-                                BlockNotificationService.resync(context: modelContext)
-                            }
-                        ),
-                        minute: Binding(
-                            get: { settings.eveningReviewMinute },
-                            set: {
-                                settings.eveningReviewMinute = $0
-                                BlockNotificationService.resync(context: modelContext)
-                            }
-                        )
-                    )
-                    .accessibilityLabel("Wrap-up time")
+                    eveningReviewTimePicker(settings: settings)
+                        .accessibilityLabel("Wrap-up time")
                 }
             }
         }
     }
 
-    /// A notification-backed toggle: turning it on asks for permission first
-    /// and re-syncs; turning it off just re-syncs.
+    /// A notification-backed toggle. Authorization finishes before the local
+    /// mutation; the preference transaction finishes before system resync.
     private func notificationToggleBinding(
+        settings: UserSettings,
         get: @escaping () -> Bool,
-        set: @escaping (Bool) -> Void
+        update: @escaping (Bool) -> BlockNotificationService.PreferenceUpdate
     ) -> Binding<Bool> {
         Binding(
             get: get,
             set: { enabled in
-                if enabled {
-                    Task { @MainActor in
-                        let granted = await NotificationService.requestAuthorization()
-                        if granted {
-                            set(true)
-                            BlockNotificationService.resync(context: modelContext)
-                        } else {
-                            set(false)
-                            showNotificationsDeniedAlert = true
-                        }
-                    }
-                } else {
-                    set(false)
-                    BlockNotificationService.resync(context: modelContext)
-                }
+                setNotificationPreference(update(enabled), settings: settings)
             }
         )
     }
 
     private func setBlockReminders(_ enabled: Bool, settings: UserSettings) {
-        if enabled {
+        setNotificationPreference(.blockRemindersEnabled(enabled), settings: settings)
+    }
+
+    private func setNotificationPreference(
+        _ update: BlockNotificationService.PreferenceUpdate,
+        settings: UserSettings
+    ) {
+        if update.requiresAuthorization {
             Task { @MainActor in
                 let granted = await NotificationService.requestAuthorization()
                 if granted {
-                    settings.blockRemindersEnabled = true
-                    BlockNotificationService.resync(context: modelContext)
+                    commitNotificationPreference(update, settings: settings)
                 } else {
-                    settings.blockRemindersEnabled = false
+                    notificationSettingIssue = nil
                     showNotificationsDeniedAlert = true
                 }
             }
         } else {
-            settings.blockRemindersEnabled = false
-            BlockNotificationService.resync(context: modelContext)
+            commitNotificationPreference(update, settings: settings)
         }
+    }
+
+    private func commitNotificationPreference(
+        _ update: BlockNotificationService.PreferenceUpdate,
+        settings: UserSettings
+    ) {
+        do {
+            try BlockNotificationService.updatePreference(
+                update,
+                settings: settings,
+                context: modelContext
+            )
+            if notificationSettingIssue == update {
+                notificationSettingIssue = nil
+            }
+        } catch {
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            notificationSettingIssue = update
+        }
+    }
+
+    private func eveningReviewTimePicker(settings: UserSettings) -> some View {
+        let date = Binding<Date>(
+            get: {
+                var components = DateComponents()
+                components.hour = settings.eveningReviewHour
+                components.minute = settings.eveningReviewMinute
+                return Calendar.current.date(from: components) ?? Date()
+            },
+            set: { newDate in
+                let components = Calendar.current.dateComponents([.hour, .minute], from: newDate)
+                setNotificationPreference(
+                    .eveningReviewTime(
+                        hour: components.hour ?? settings.eveningReviewHour,
+                        minute: components.minute ?? settings.eveningReviewMinute
+                    ),
+                    settings: settings
+                )
+            }
+        )
+
+        return DatePicker("", selection: date, displayedComponents: .hourAndMinute)
+            .labelsHidden()
+            .fixedSize(horizontal: true, vertical: false)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
     }
 
     // MARK: - Calendar
@@ -483,20 +656,129 @@ struct SettingsView: View {
     }
 
     private func setCalendarExport(_ enabled: Bool, settings: UserSettings) {
+        let requestID = UUID()
+        appleExportRequestID = requestID
+        calendarSettingIssue = nil
+        calendarSettingRetry = nil
+
         if enabled {
             Task { @MainActor in
                 let granted = await CalendarExportService.requestAccess()
+                guard appleExportRequestID == requestID else { return }
                 if granted {
-                    settings.exportToAppleCalendar = true
-                    CalendarExportService.syncIfEnabled(context: modelContext)
+                    commitCalendarExportPreference(
+                        true,
+                        settings: settings,
+                        requestID: requestID
+                    )
                 } else {
-                    settings.exportToAppleCalendar = false
                     showCalendarDeniedAlert = true
                 }
             }
         } else {
-            settings.exportToAppleCalendar = false
-            CalendarExportService.removeExportedEvents(context: modelContext)
+            commitCalendarExportPreference(
+                false,
+                settings: settings,
+                requestID: requestID
+            )
+        }
+    }
+
+    private func commitCalendarExportPreference(
+        _ enabled: Bool,
+        settings: UserSettings,
+        requestID: UUID
+    ) {
+        guard appleExportRequestID == requestID else { return }
+        do {
+            try CalendarExportService.setExportEnabled(
+                enabled,
+                settings: settings,
+                context: modelContext
+            )
+        } catch {
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            calendarSettingIssue = enabled
+                ? "Filuma couldn’t save Apple Calendar export, so the setting stayed off. Try again."
+                : "Filuma couldn’t turn Apple Calendar export off, so the setting stayed on. Try again."
+            calendarSettingRetry = .setAppleExport(enabled)
+            return
+        }
+
+        reconcileAppleCalendarExport(
+            enabled,
+            settings: settings,
+            requestID: requestID
+        )
+    }
+
+    private func reconcileAppleCalendarExport(
+        _ enabled: Bool,
+        settings: UserSettings,
+        requestID: UUID
+    ) {
+        // Authorization and alert presentation can yield. Both the request and
+        // the durable toggle must still own this operation immediately before
+        // any EventKit change begins.
+        guard CalendarExportService.isReconciliationCurrent(
+            expectedEnabled: enabled,
+            durableEnabled: settings.exportToAppleCalendar,
+            requestID: requestID,
+            currentRequestID: appleExportRequestID
+        ) else { return }
+        do {
+            if enabled {
+                try CalendarExportService.syncNow(context: modelContext, settings: settings)
+            } else {
+                try CalendarExportService.removeExportedEvents(
+                    context: modelContext,
+                    settings: settings
+                )
+            }
+        } catch {
+            // The preference is already durable. Never roll it back over an
+            // EventKit or identifier-mirror result that cannot be rolled back
+            // with it; report the exact retained state and offer reconciliation.
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            calendarSettingIssue = enabled
+                ? "Apple Calendar export is on, but Filuma couldn’t finish refreshing its calendar yet. Your blocks are safe here; retry the export."
+                : "Apple Calendar export is off, but Filuma couldn’t finish removing its calendar yet. Retry the cleanup when Calendar is available."
+            calendarSettingRetry = .reconcileAppleExport(enabled)
+        }
+    }
+
+    private func retryCalendarSetting(
+        _ retry: CalendarSettingRetry,
+        settings: UserSettings
+    ) {
+        switch retry {
+        case .setAppleExport(let enabled):
+            setCalendarExport(enabled, settings: settings)
+        case .reconcileAppleExport(let enabled):
+            let requestID = UUID()
+            appleExportRequestID = requestID
+            Task { @MainActor in
+                let granted = await CalendarExportService.requestAccess()
+                guard CalendarExportService.isReconciliationCurrent(
+                    expectedEnabled: enabled,
+                    durableEnabled: settings.exportToAppleCalendar,
+                    requestID: requestID,
+                    currentRequestID: appleExportRequestID
+                ) else { return }
+                if granted {
+                    reconcileAppleCalendarExport(
+                        enabled,
+                        settings: settings,
+                        requestID: requestID
+                    )
+                } else {
+                    showCalendarDeniedAlert = true
+                    calendarSettingIssue = enabled
+                        ? "Apple Calendar export is on, but Calendar access is needed to finish refreshing it."
+                        : "Apple Calendar export is off, but Calendar access is needed to remove Filuma’s calendar."
+                    calendarSettingRetry = .reconcileAppleExport(enabled)
+                }
+            }
         }
     }
 
@@ -505,18 +787,37 @@ struct SettingsView: View {
             Task { @MainActor in
                 let granted = await CalendarExportService.requestAccess()
                 if granted {
-                    settings.importFromAppleCalendar = true
-                    CalendarImportService.syncNow(context: modelContext, settings: settings)
-                    // Scheduled work moves out of the way of the imported events.
-                    replanAfterBusyChange(context: modelContext)
+                    do {
+                        try CalendarImportService.enableImport(
+                            settings: settings,
+                            context: modelContext
+                        )
+                        // Scheduled work moves out of the way of the imported events.
+                        if !replanAfterBusyChange(context: modelContext) {
+                            calendarSettingRetry = nil
+                            calendarSettingIssue = "Apple Calendar import is on and your events are safe, but Filuma couldn’t refresh the plan yet. The next foreground refresh will retry."
+                        }
+                    } catch {
+                        UINotificationFeedbackGenerator().notificationOccurred(.error)
+                        calendarSettingRetry = nil
+                        calendarSettingIssue = "Filuma couldn’t read the existing calendar mirror safely, so Apple Calendar import stayed off. Try again."
+                    }
                 } else {
                     settings.importFromAppleCalendar = false
                     showCalendarDeniedAlert = true
                 }
             }
         } else {
-            settings.importFromAppleCalendar = false
-            CalendarImportService.removeImportedEvents(context: modelContext)
+            do {
+                try CalendarImportService.disableImport(
+                    settings: settings,
+                    context: modelContext
+                )
+            } catch {
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+                calendarSettingRetry = nil
+                calendarSettingIssue = "Filuma couldn’t turn Apple Calendar import off yet, so the setting and imported busy times are unchanged. Try again."
+            }
         }
     }
 
@@ -531,7 +832,7 @@ struct SettingsView: View {
     }
 
     private func pushBlocksNow(settings: UserSettings) {
-        withAnimation {
+        withAnimation(reduceMotion ? HearthMotion.reduced : HearthMotion.selection) {
             didPushNow = false
             showPushNowError = false
         }
@@ -540,20 +841,24 @@ struct SettingsView: View {
             if granted {
                 do {
                     try CalendarExportService.syncNow(context: modelContext, settings: settings)
-                    withAnimation {
+                    withAnimation(reduceMotion ? HearthMotion.reduced : HearthMotion.selection) {
                         showPushNowError = false
                         didPushNow = true
                     }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                        withAnimation { didPushNow = false }
+                        withAnimation(reduceMotion ? HearthMotion.reduced : HearthMotion.selection) {
+                            didPushNow = false
+                        }
                     }
                 } catch {
-                    withAnimation {
+                    withAnimation(reduceMotion ? HearthMotion.reduced : HearthMotion.selection) {
                         didPushNow = false
                         showPushNowError = true
                     }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                        withAnimation { showPushNowError = false }
+                        withAnimation(reduceMotion ? HearthMotion.reduced : HearthMotion.selection) {
+                            showPushNowError = false
+                        }
                     }
                 }
             } else {
@@ -585,13 +890,15 @@ struct SettingsView: View {
                     .frame(minWidth: 44, minHeight: 44)
                     .accessibilityLabel("Disconnect Google Calendar")
                 }
-                .confirmationDialog("Disconnect Google Calendar?", isPresented: $confirmGoogleDisconnect, titleVisibility: .visible) {
+                .alert("Disconnect Google Calendar?", isPresented: $confirmGoogleDisconnect) {
+                    Button("Stay connected", role: .cancel) { }
+                        .accessibilityIdentifier("settings.google.disconnect.cancel")
                     Button("Disconnect", role: .destructive) {
-                        disconnectGoogle()
+                        disconnectGoogle(settings)
                     }
-                    Button("Stay connected", role: .cancel) {}
+                    .accessibilityIdentifier("settings.google.disconnect.confirm")
                 } message: {
-                    Text("Imported Google events are removed and your schedule replans around the time they free up.")
+                    Text("Imported Google events are removed, and future scheduling stops treating them as busy. Work blocks Filuma already exported stay in Google Calendar after disconnecting.")
                 }
 
                 if settings.googleNeedsReconnect {
@@ -634,6 +941,33 @@ struct SettingsView: View {
                     .labelsHidden()
                     .toggleStyle(HearthToggleStyle())
                 }
+
+                if let syncIssue = googleSyncIssue {
+                    Button {
+                        performGoogleSync(syncIssue, settings: settings)
+                    } label: {
+                        SettingsRow(
+                            icon: "arrow.clockwise.circle.fill",
+                            tint: .filumaRed,
+                            label: syncIssue.retryLabel,
+                            labelTint: .filumaRed
+                        ) {
+                            if googleSyncInFlight == syncIssue {
+                                ProgressView()
+                                    .tint(Color.brand300)
+                            } else {
+                                Text("Retry")
+                                    .font(AppFont.caption(12))
+                                    .foregroundStyle(Color.brand300)
+                                    .frame(minHeight: 44)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(googleSyncInFlight != nil)
+                    .accessibilityLabel(syncIssue.retryLabel)
+                    .accessibilityHint("Attempts this Google Calendar sync again")
+                }
             } else {
                 Button {
                     connectGoogle(settings)
@@ -662,12 +996,19 @@ struct SettingsView: View {
             defer { isConnectingGoogle = false }
             do {
                 let tokens = try await GoogleOAuth.shared.connect()
-                settings.googleAccountEmail = tokens.email ?? "Google account"
-                settings.googleNeedsReconnect = false
-                settings.googleSyncToken = nil
-                // Connecting is the ask to import; export stays opt-in.
-                settings.importFromGoogleCalendar = true
-                await GoogleCalendarService.importNow(context: modelContext, settings: settings)
+                do {
+                    try GoogleCalendarService.commitConnection(
+                        email: tokens.email ?? "Google account",
+                        settings: settings,
+                        context: modelContext
+                    )
+                } catch {
+                    // OAuth has already written these credentials. Do not
+                    // leave them orphaned if the account row cannot commit.
+                    GoogleOAuth.disconnect()
+                    throw error
+                }
+                performGoogleSync(.importBusyTimes, settings: settings)
             } catch GoogleAuthError.cancelled {
                 // The user backed out of the consent screen — not an error.
             } catch {
@@ -676,33 +1017,136 @@ struct SettingsView: View {
         }
     }
 
-    private func disconnectGoogle() {
-        GoogleCalendarService.disconnect(context: modelContext)
+    private func disconnectGoogle(_ settings: UserSettings) {
+        do {
+            try GoogleCalendarService.disconnect(
+                settings: settings,
+                context: modelContext
+            )
+            googleSyncIssue = nil
+            cancelGoogleSyncUI()
+        } catch {
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            calendarSettingRetry = nil
+            calendarSettingIssue = "Filuma couldn’t finish disconnecting yet, so your Google account and imported busy times are unchanged. Try Disconnect again."
+        }
     }
 
     private func setGoogleImport(_ enabled: Bool, settings: UserSettings) {
-        settings.importFromGoogleCalendar = enabled
-        // Either direction invalidates the incremental cursor: re-enabling
-        // must start from a full window fetch.
-        settings.googleSyncToken = nil
         if enabled {
-            Task { @MainActor in
-                await GoogleCalendarService.importNow(context: modelContext, settings: settings)
+            do {
+                try GoogleCalendarService.enableImport(
+                    settings: settings,
+                    context: modelContext
+                )
+                performGoogleSync(.importBusyTimes, settings: settings)
+            } catch {
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+                calendarSettingRetry = nil
+                calendarSettingIssue = "Filuma couldn’t turn Google import on yet, so the setting stayed off. Try again."
             }
         } else {
-            GoogleCalendarService.removeImportedEvents(context: modelContext)
-            replanAfterBusyChange(context: modelContext)
+            do {
+                try GoogleCalendarService.disableImport(
+                    settings: settings,
+                    context: modelContext
+                )
+                cancelGoogleSyncUI(.importBusyTimes)
+                if googleSyncIssue == .importBusyTimes { googleSyncIssue = nil }
+            } catch {
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+                calendarSettingRetry = nil
+                calendarSettingIssue = "Filuma couldn’t turn Google import off yet, so the setting and imported busy times are unchanged. Try again."
+            }
         }
     }
 
     private func setGoogleExport(_ enabled: Bool, settings: UserSettings) {
-        settings.exportToGoogleCalendar = enabled
-        if enabled {
-            Task { @MainActor in
-                await GoogleCalendarService.exportNow(context: modelContext, settings: settings)
+        do {
+            try GoogleCalendarService.setExportEnabled(
+                enabled,
+                settings: settings,
+                context: modelContext
+            )
+            if enabled {
+                performGoogleSync(.exportBlocks, settings: settings)
+            } else {
+                cancelGoogleSyncUI(.exportBlocks)
+                if googleSyncIssue == .exportBlocks { googleSyncIssue = nil }
             }
-        } else {
-            GoogleCalendarService.removeExportedEvents(context: modelContext)
+        } catch {
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            calendarSettingRetry = nil
+            calendarSettingIssue = enabled
+                ? "Filuma couldn’t turn Google export on yet, so the setting stayed off. Try again."
+                : "Filuma couldn’t turn Google export off yet, so the setting stayed on. Try again."
+        }
+    }
+
+    private func performGoogleSync(
+        _ operation: GoogleSyncOperation,
+        settings: UserSettings
+    ) {
+        // A fresh explicit choice supersedes the Settings presentation for an
+        // older request. The service serializes/coalesces imports internally;
+        // this request ID only prevents a stale completion from clearing or
+        // replacing feedback for the newer choice.
+        googleSyncTask?.cancel()
+        let requestID = UUID()
+        googleSyncRequestID = requestID
+        googleSyncInFlight = operation
+        if googleSyncIssue == operation { googleSyncIssue = nil }
+
+        googleSyncTask = Task { @MainActor in
+            let result: GoogleCalendarService.SyncResult
+            switch operation {
+            case .importBusyTimes:
+                result = await GoogleCalendarService.importNow(
+                    context: modelContext,
+                    settings: settings
+                )
+            case .exportBlocks:
+                result = await GoogleCalendarService.exportNow(
+                    context: modelContext,
+                    settings: settings
+                )
+            }
+
+            guard googleSyncRequestID == requestID else { return }
+            googleSyncTask = nil
+            googleSyncRequestID = nil
+            googleSyncInFlight = nil
+            handleGoogleSyncResult(result, operation: operation)
+        }
+    }
+
+    private func cancelGoogleSyncUI(_ operation: GoogleSyncOperation? = nil) {
+        guard operation == nil || googleSyncInFlight == operation else { return }
+        googleSyncTask?.cancel()
+        googleSyncTask = nil
+        googleSyncRequestID = nil
+        googleSyncInFlight = nil
+    }
+
+    private func handleGoogleSyncResult(
+        _ result: GoogleCalendarService.SyncResult,
+        operation: GoogleSyncOperation
+    ) {
+        switch result {
+        case .success:
+            if googleSyncIssue == operation { googleSyncIssue = nil }
+        case .needsReconnect:
+            if googleSyncIssue == operation { googleSyncIssue = nil }
+            UINotificationFeedbackGenerator().notificationOccurred(.warning)
+        case .failed:
+            googleSyncIssue = operation
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            UIAccessibility.post(
+                notification: .announcement,
+                argument: operation.failureAnnouncement
+            )
+        case .queued, .disabled, .cancelled:
+            break
         }
     }
 
@@ -711,7 +1155,7 @@ struct SettingsView: View {
     private var aboutSection: some View {
         SettingsGroup(
             title: "About",
-            footer: "Export writes everything Filuma knows — tasks, blocks, sessions, reminders, history — to a plain JSON file. Your data is yours."
+            footer: "Export writes your tasks, blocks, sessions, reminders, blocked times, and preferences to a plain JSON file. OAuth credentials are never included. Your data is yours."
         ) {
             SettingsRow(icon: "info.circle", tint: .filumaSubtle, label: "Version") {
                 Text(appVersion)
@@ -729,6 +1173,16 @@ struct SettingsView: View {
             .buttonStyle(.plain)
             .accessibilityLabel("Privacy Policy, opens in browser")
 
+            Link(destination: URL(string: "https://sparkbiscuit.me/")!) {
+                SettingsRow(icon: "questionmark.circle.fill", tint: .filumaSubtle, label: "Help & Support") {
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.filumaFaint)
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Help and Support, opens in browser")
+
             if let url = exportFileURL {
                 ShareLink(item: url) {
                     SettingsRow(icon: "square.and.arrow.up", tint: .brand300, label: "Share the export", labelTint: .brand300) {
@@ -738,7 +1192,7 @@ struct SettingsView: View {
                 .buttonStyle(.plain)
             } else {
                 Button {
-                    exportFileURL = try? DataExporter.writeExportFile(context: modelContext)
+                    prepareExport()
                 } label: {
                     SettingsRow(icon: "shippingbox", tint: .brand300, label: "Export my data", labelTint: .brand300) {
                         EmptyView()
@@ -747,6 +1201,21 @@ struct SettingsView: View {
                 .buttonStyle(.plain)
             }
         }
+    }
+
+    private func prepareExport() {
+        do {
+            exportFileURL = try DataExporter.writeExportFile(context: modelContext)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+        } catch {
+            showExportFailed = true
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+        }
+    }
+
+    private func openSystemSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
     }
 
     private var appVersion: String {
@@ -767,18 +1236,18 @@ private struct SettingsGroup<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(title.uppercased())
-                .font(AppFont.settingsSectionHeader())
+            Text(title)
+                .font(AppFont.heading(13))
                 .foregroundStyle(Color.filumaSubtle)
-                .kerning(1.2)
                 .padding(.leading, 4)
+                .accessibilityAddTraits(.isHeader)
 
             VStack(spacing: 0) {
                 Group(subviews: content) { subviews in
                     ForEach(Array(subviews.enumerated()), id: \.offset) { index, subview in
                         if index > 0 {
                             Divider()
-                                .overlay(Color.white.opacity(0.05))
+                                .overlay(Color.filumaBorder)
                                 .padding(.leading, 56)
                         }
                         subview
@@ -797,9 +1266,10 @@ private struct SettingsGroup<Content: View>: View {
                     .font(AppFont.body(12))
                     .foregroundStyle(Color.filumaFaint)
                     .padding(.horizontal, 4)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(.horizontal, 20)
+        .padding(.horizontal, FilumaSpacing.screen)
         .padding(.bottom, 22)
     }
 }
@@ -808,13 +1278,34 @@ private struct SettingsGroup<Content: View>: View {
 
 /// Icon tile + label + trailing control, the Hearthlight settings row.
 private struct SettingsRow<Trailing: View>: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     let icon: String
     let tint: Color
     let label: String
     var labelTint: Color = .filumaText
     @ViewBuilder var trailing: Trailing
 
+    @ViewBuilder
     var body: some View {
+        if dynamicTypeSize.isAccessibilitySize {
+            VStack(alignment: .leading, spacing: 10) {
+                iconAndLabel
+                trailing
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+            .settingsRowChrome(verticalPadding: 10)
+        } else {
+            HStack(spacing: 12) {
+                iconAndLabel
+                Spacer(minLength: 8)
+                trailing
+            }
+            .settingsRowChrome(verticalPadding: 5)
+        }
+    }
+
+    private var iconAndLabel: some View {
         HStack(spacing: 12) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -829,17 +1320,97 @@ private struct SettingsRow<Trailing: View>: View {
             Text(label)
                 .font(AppFont.settingsRowLabel())
                 .foregroundStyle(labelTint)
-
-            Spacer(minLength: 8)
-
-            trailing
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.horizontal, 14)
-        // Controls may be visually smaller, but every row remains at least a
-        // comfortable 44pt target without making the existing cards taller.
-        .padding(.vertical, 5)
-        .frame(minHeight: 54)
-        .contentShape(Rectangle())
+    }
+}
+
+private extension View {
+    func settingsRowChrome(verticalPadding: CGFloat) -> some View {
+        self
+            .padding(.horizontal, 14)
+            .padding(.vertical, verticalPadding)
+            .frame(minHeight: 54)
+            .contentShape(Rectangle())
+    }
+}
+
+// MARK: - Signature hearth panel
+
+/// Settings gets one authored surface rather than another generic row group:
+/// the live accent choice is the visible source of the app's warmth. It stays
+/// still, responds immediately, and lets the rest of the screen remain quiet.
+private struct HearthAccentPanel: View {
+    let selectedAccent: HearthAccent
+    let onSelect: (HearthAccent) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 15) {
+            HStack(spacing: 14) {
+                ZStack {
+                    Circle()
+                        .fill(Color.brand500.opacity(0.16))
+                        .frame(width: 54, height: 54)
+                    Circle()
+                        .stroke(Color.brand300.opacity(0.34), lineWidth: 1)
+                        .frame(width: 54, height: 54)
+                    Image(systemName: "flame.fill")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundStyle(LinearGradient.hearth)
+                        .hearthGlow(.brand500, radius: 10, opacity: 0.5)
+                }
+                .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Your Hearth")
+                        .font(AppFont.heading(12))
+                        .foregroundStyle(Color.brand300)
+                        .accessibilityIdentifier("settings.hearth.title")
+                    Text(selectedAccent.displayName)
+                        .font(AppFont.heading(19))
+                        .foregroundStyle(Color.filumaText)
+                    Text("This warmth follows every active thread.")
+                        .font(AppFont.body(12))
+                        .foregroundStyle(Color.filumaSubtle)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Rectangle()
+                .fill(Color.filumaBorder)
+                .frame(height: 1)
+                .accessibilityHidden(true)
+
+            HStack(spacing: 4) {
+                ForEach(HearthAccent.allCases) { accent in
+                    AccentSwatch(
+                        accent: accent,
+                        isSelected: selectedAccent == accent,
+                        action: { onSelect(accent) }
+                    )
+                }
+                Spacer(minLength: 0)
+                Text("Choose a flame")
+                    .font(AppFont.caption(11))
+                    .foregroundStyle(Color.filumaFaint)
+            }
+        }
+        .padding(18)
+        .background {
+            RoundedRectangle(cornerRadius: FilumaRadius.hero, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        colors: [Color.brand500.opacity(0.13), Color.filumaSurface],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: FilumaRadius.hero, style: .continuous)
+                .stroke(Color.brand500.opacity(0.24), lineWidth: 1)
+        }
+        .hearthGlow(.brand500, radius: 22, opacity: 0.09)
     }
 }
 
@@ -852,26 +1423,35 @@ private struct AccentSwatch: View {
 
     var body: some View {
         Button(action: action) {
-            Circle()
-                .fill(
-                    LinearGradient(
-                        colors: [accent.soft, accent.color],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
+            ZStack {
+                Circle()
+                    .fill(
+                        LinearGradient(
+                            colors: [accent.hi, accent.soft],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
                     )
-                )
-                .frame(width: 24, height: 24)
-                .overlay(
-                    Circle()
-                        .stroke(isSelected ? accent.hi : Color.white.opacity(0.1), lineWidth: 2)
-                )
-                .shadow(color: isSelected ? accent.color.opacity(0.6) : .clear, radius: 8)
+                    .frame(width: 26, height: 26)
+                    .overlay(
+                        Circle()
+                            .stroke(isSelected ? accent.hi : Color.filumaBorder, lineWidth: 2)
+                    )
+                    .shadow(color: isSelected ? accent.color.opacity(0.6) : .clear, radius: 8)
+
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .black))
+                        .foregroundStyle(Color.filumaControlInk)
+                }
+            }
         }
         .buttonStyle(.plain)
         .frame(width: 44, height: 44)
         .contentShape(Circle())
         .accessibilityLabel("\(accent.displayName) flame")
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+        .accessibilityIdentifier("settings.hearth.\(accent.rawValue)")
     }
 }
 
@@ -885,6 +1465,7 @@ private struct CalendarPickerView: View {
     let settings: UserSettings
 
     @State private var calendarsBySource: [(source: String, calendars: [EKCalendar])] = []
+    @State private var updateIssue: String?
 
     var body: some View {
         List {
@@ -904,10 +1485,9 @@ private struct CalendarPickerView: View {
                         .toggleStyle(HearthToggleStyle())
                     }
                 } header: {
-                    Text(group.source.uppercased())
-                        .font(AppFont.settingsSectionHeader())
+                    Text(group.source)
+                        .font(AppFont.heading(13))
                         .foregroundStyle(Color.filumaSubtle)
-                        .kerning(1.2)
                 }
                 .listRowBackground(Color.filumaSurface)
             }
@@ -923,10 +1503,18 @@ private struct CalendarPickerView: View {
             }
         }
         .onAppear(perform: loadCalendars)
-        .onDisappear {
-            // One re-sync when leaving, instead of one per toggle flip.
-            CalendarImportService.syncNow(context: modelContext, settings: settings)
-            replanAfterBusyChange(context: modelContext)
+        .alert(
+            "Calendar update needs attention",
+            isPresented: Binding(
+                get: { updateIssue != nil },
+                set: { if !$0 { updateIssue = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) {
+                updateIssue = nil
+            }
+        } message: {
+            Text(updateIssue ?? "")
         }
     }
 
@@ -949,10 +1537,25 @@ private struct CalendarPickerView: View {
         Binding(
             get: { !settings.excludedCalendarIds.contains(calendar.calendarIdentifier) },
             set: { included in
+                var nextExcludedIds = settings.excludedCalendarIds
                 if included {
-                    settings.excludedCalendarIds.removeAll { $0 == calendar.calendarIdentifier }
-                } else if !settings.excludedCalendarIds.contains(calendar.calendarIdentifier) {
-                    settings.excludedCalendarIds.append(calendar.calendarIdentifier)
+                    nextExcludedIds.removeAll { $0 == calendar.calendarIdentifier }
+                } else if !nextExcludedIds.contains(calendar.calendarIdentifier) {
+                    nextExcludedIds.append(calendar.calendarIdentifier)
+                }
+
+                do {
+                    try CalendarImportService.updateExcludedCalendars(
+                        nextExcludedIds,
+                        settings: settings,
+                        context: modelContext
+                    )
+                    if !replanAfterBusyChange(context: modelContext) {
+                        updateIssue = "Your calendar choice is saved, but Filuma couldn’t safely refresh the plan yet. The next foreground refresh will retry."
+                    }
+                } catch {
+                    UINotificationFeedbackGenerator().notificationOccurred(.error)
+                    updateIssue = "Filuma couldn’t safely refresh that calendar, so your choice and existing busy times are unchanged. Try again."
                 }
             }
         )

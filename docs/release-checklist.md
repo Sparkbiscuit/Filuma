@@ -1,6 +1,6 @@
 # Filuma — TestFlight / App Store submission checklist
 
-State as of 2026-08-23 (v1.3.0, build 5). Checked items below were verified
+State as of 2026-08-23 (v1.3.0, build 6). Checked items below were verified
 against frozen compiled-input fingerprint
 `62608e6481ef259eacb3496a0968e1e530eb4e6bfd4395f0b024ff5163398b3f`.
 Unchecked items require a human, App Store Connect / Google Cloud access,
@@ -76,15 +76,11 @@ distribution signing, or a physical-device pass.
       `https://sparkbiscuit.me/` and `https://sparkbiscuit.me/privacy/` both
       returned HTTP 200 over HTTPS. Enter and re-check these exact URLs in App
       Store Connect before submission.
-- [ ] **Tighten two privacy-policy absolutes before submission.** The live
-      policy currently says Export writes “everything Filuma knows,” while the
-      portable file intentionally excludes imported calendar-event copies,
-      OAuth credentials, and sync cursors. It also says deleting the app
-      deletes all Filuma data, although iOS Keychain credentials may survive an
-      uninstall until disconnect/revocation or a later cleanup. Replace both
-      absolutes with the exact export categories and deletion behavior, deploy,
-      then re-check the live page. The in-app exporter and README already use
-      the narrower, truthful wording.
+- [x] **Tighten two privacy-policy absolutes before submission.** The policy
+      now names the exact portable export categories and exclusions, explains
+      direct optional Calendar transmission, and accurately describes local,
+      Keychain, backup, and exported-calendar deletion behavior. The corrected
+      page was deployed and returned HTTP 200 on 2026-08-23.
 - [x] **Add the Privacy Policy link inside the app.** Settings → About now
       links to `https://sparkbiscuit.me/privacy/` (added 2026-07-18).
 - [ ] **Choose and implement the subscription product before charging.** The
@@ -99,11 +95,13 @@ distribution signing, or a physical-device pass.
 - [x] **Archive with Xcode 26 or later and the iOS 26 SDK or later.** The frozen
       local archive was built with Xcode 26.6 and the iOS 26.5 SDK, satisfying
       the technical SDK floor in effect for uploads since April 28, 2026.
-- [ ] **Prove distribution signing and upload.** The successful signed Release
-      build uses an Apple Development identity with `get-task-allow=true`, and
-      the verified archive is intentionally unsigned. Create an App Store
-      distribution-signed archive in Organizer, validate/export it, and upload
-      it to App Store Connect before treating the binary as submission-ready.
+- [x] **Prove distribution signing and upload.** Build 6 exported successfully
+      with Apple's cloud-managed distribution certificate and App Store
+      provisioning for both app and widget. The exported app has
+      `get-task-allow=false`, both targets retain
+      `group.com.christoforakis.Filuma`, and Xcode reported **Upload succeeded**
+      at 23:10 on 2026-08-23. App Store Connect processing still must finish
+      before the build can be attached to the version.
 - [ ] **Google OAuth consent screen**: in Google Cloud Console, confirm the
       OAuth consent screen is **published** (not "Testing") and, if Google
       flags the `calendar.events` scope as sensitive, that verification is
@@ -120,9 +118,11 @@ distribution signing, or a physical-device pass.
       marketing copy. Do not assume 4+ if the listing frames Filuma as ADHD or
       health/wellness support; use the rating App Store Connect derives from
       the truthful answers.
-- [ ] **Capture required screenshots**: current iPhone screenshots plus the
+- [x] **Capture required screenshots**: build 6 iPhone screenshots plus the
       required **13-inch iPad** set because the app ships natively to iPad.
-      Review iPad composition rather than merely scaling the phone layout.
+      The curated sets are preserved under `AppStoreAssets/1.3.0-build6` at
+      1242×2688 and 2064×2752. The iPad compositions are native layouts rather
+      than scaled phone captures.
 - [ ] **Physical-device capability pass**: install an archive-signed build and
       verify the shared SwiftData store/App Group across the app and widget,
       widget refresh, Live Activity start/deep link/pause/resume/end from the

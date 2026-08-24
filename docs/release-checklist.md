@@ -100,8 +100,8 @@ distribution signing, or a physical-device pass.
       provisioning for both app and widget. The exported app has
       `get-task-allow=false`, both targets retain
       `group.com.christoforakis.Filuma`, and Xcode reported **Upload succeeded**
-      at 23:10 on 2026-08-23. App Store Connect processing still must finish
-      before the build can be attached to the version.
+      at 23:10 on 2026-08-23. App Store Connect then finished processing build
+      6 and reports it **Ready to Submit**.
 - [ ] **Google OAuth consent screen**: in Google Cloud Console, confirm the
       OAuth consent screen is **published** (not "Testing") and, if Google
       flags the `calendar.events` scope as sensitive, that verification is

@@ -68,8 +68,13 @@ The App Store version should have **Sign-in required** turned off.
 
 - The current binary contains no analytics, advertising, tracking SDK, Filuma
   server, or Filuma account system.
-- The code and privacy manifest support the App Store answer **Data Not
-  Collected**, subject to the owner's final attestation in App Store Connect.
+- Most data is local-only. However, when the user enables Google Calendar
+  export, task-derived work-block titles and times are written to the user's
+  Google account on an ongoing basis. Apple's definition of collection includes
+  data retained by a third-party partner beyond a real-time request, and its
+  optional-disclosure exception does not apply to ongoing collection after one
+  permission. Use the conservative App Store privacy disclosure documented in
+  `app-store-privacy-disclosure.md`; do **not** publish “Data Not Collected.”
 - The listing makes no medical or diagnostic claims. The age-rating
   questionnaire should be answered from the app's actual general-productivity
   content rather than targeting a predetermined rating.

@@ -61,10 +61,13 @@ distribution signing, or a physical-device pass.
       filename, and all user-facing copy. Remaining human steps:
       - Reserve the name “Filuma” in App Store Connect and run a trademark
         search to confirm availability.
-      - **Google Cloud Console**: the iOS OAuth client is still registered
-        under bundle ID `com.christoforakis.Loom` — update it (or create a new
-        iOS client) for `com.christoforakis.Filuma`. The reversed-client-ID
-        redirect scheme in `Info.plist` is unchanged.
+      - **Google OAuth client**: build 6 reaches Google's branded “Sign in to
+        continue to Filuma” page and Google displays Filuma's Privacy Policy and
+        Terms of Service links, proving the current client ID and redirect enter
+        a valid Filuma OAuth flow. Google Cloud Console must still confirm that
+        the iOS client's registered bundle ID is
+        `com.christoforakis.Filuma` and that production publishing/verification
+        is complete.
       - **Apple Developer portal**: register the new bundle IDs and App Group
         `group.com.christoforakis.Filuma` (automatic signing will offer this on
         the next signed build; confirm provisioning for both targets).
@@ -109,11 +112,15 @@ distribution signing, or a physical-device pass.
       App Review with a working demo account or precise review instructions for
       the optional integration.
 - [ ] **App Privacy label** (App Store Connect → App Privacy): answer
-      accurately for the submitted binary and published policy. The current
-      code audit supports **"Data Not Collected"** — data is local SwiftData,
-      Google Calendar calls act on the user's account, and no Filuma backend,
-      analytics, ads, tracking, or third-party SDKs were found — but verify the
-      archive privacy report and App Store Connect definitions before attesting.
+      accurately for the submitted binary and published policy. Local
+      SwiftData, Apple framework processing, and transient OAuth requests do
+      not by themselves require disclosure, but optional Google Calendar export
+      writes task-derived work-block content to the user's Google account on an
+      ongoing basis. Apple's current definition and optional-disclosure rules
+      make **Other User Content — linked to the user — App Functionality — not
+      tracking** the conservative answer. See
+      `docs/app-store-privacy-disclosure.md`; do not attest “Data Not
+      Collected.”
 - [ ] **Age rating questionnaire**: answer for the exact submitted product and
       marketing copy. Do not assume 4+ if the listing frames Filuma as ADHD or
       health/wellness support; use the rating App Store Connect derives from

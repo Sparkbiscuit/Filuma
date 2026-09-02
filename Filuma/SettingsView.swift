@@ -1294,7 +1294,7 @@ struct SettingsView: View {
                     .foregroundStyle(Color.filumaSubtle)
             }
 
-            Link(destination: URL(string: "https://sparkbiscuit.me/privacy")!) {
+            Link(destination: FilumaLegalURLs.privacy) {
                 SettingsRow(icon: "hand.raised.fill", tint: .filumaSubtle, label: "Privacy Policy") {
                     Image(systemName: "arrow.up.right")
                         .font(.system(size: 12, weight: .semibold))
@@ -1303,6 +1303,16 @@ struct SettingsView: View {
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Privacy Policy, opens in browser")
+
+            Link(destination: FilumaLegalURLs.termsOfUse) {
+                SettingsRow(icon: "doc.text.fill", tint: .filumaSubtle, label: "Terms of Use") {
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(Color.filumaFaint)
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Terms of Use, opens in browser")
 
             Link(destination: URL(string: "https://sparkbiscuit.me/")!) {
                 SettingsRow(icon: "questionmark.circle.fill", tint: .filumaSubtle, label: "Help & Support") {

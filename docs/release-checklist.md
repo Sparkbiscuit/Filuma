@@ -157,12 +157,16 @@ distribution signing, or a physical-device pass.
 
 ## App Review notes (paste into "Notes for Review")
 
-- Google Calendar sync is optional; the app is fully usable without it.
-  If review needs a Google account to test sync, provide a demo account
-  (Guideline 2.1 — demo credentials for any feature behind a login).
-- Microphone/speech is used only for dictating a task in the capture sheet.
-- The Live Activity's inline pause/resume control intentionally changes only
-  the current work-session timer and does not open the app.
+```
+Filuma is fully usable without an account or login. Sign-in required should remain OFF.
+
+Google Calendar sync is optional and not required to review core features (tasks, scheduling, Focus, Weave, widgets). No demo account is needed for the main app. If you choose to test Google Calendar, use any Google account; Filuma requests calendar.events access only after the reviewer taps Connect Google Calendar in Settings.
+
+Filuma Pro is an auto-renewable subscription (monthly and annual). The paywall shows subscription title, length, and price before purchase, plus functional Privacy Policy and Terms of Use (EULA) links. Restore Purchases is available on the paywall and in Settings.
+
+Privacy Policy: https://sparkbiscuit.me/privacy/
+Terms of Use (Apple Standard EULA): https://www.apple.com/legal/internet-services/itunes/dev/stdeula/
+```
 
 ## Recommended device pass before TestFlight
 

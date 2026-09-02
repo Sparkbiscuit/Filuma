@@ -10,6 +10,14 @@ enum FilumaProProduct {
     static let all = [monthly, annual]
 }
 
+/// Shared legal destinations for App Review 3.1.2(c) (paywall + Settings).
+enum FilumaLegalURLs {
+    static let privacy = URL(string: "https://sparkbiscuit.me/privacy/")!
+    static let termsOfUse = URL(
+        string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/"
+    )!
+}
+
 @MainActor
 @Observable
 final class FilumaProStore {
@@ -213,10 +221,7 @@ struct FilumaPaywallView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    private let privacyURL = URL(string: "https://sparkbiscuit.me/privacy/")!
-    private let termsURL = URL(
-        string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/"
-    )!
+    @State private var products: [Product] = []
 
     var body: some View {
         NavigationStack {
@@ -246,13 +251,15 @@ struct FilumaPaywallView: View {
                     }
 
                     proBenefits
+                    subscriptionDisclosure
+                    legalLinks
                 }
                 .padding(.horizontal, FilumaSpacing.screen)
                 .padding(.top, 12)
             }
             .storeButton(.visible, for: .restorePurchases)
-            .subscriptionStorePolicyDestination(url: privacyURL, for: .privacyPolicy)
-            .subscriptionStorePolicyDestination(url: termsURL, for: .termsOfService)
+            .subscriptionStorePolicyDestination(url: FilumaLegalURLs.privacy, for: .privacyPolicy)
+            .subscriptionStorePolicyDestination(url: FilumaLegalURLs.termsOfUse, for: .termsOfService)
             .tint(Color.brand500)
             .background {
                 HearthScreenBackground(
@@ -280,6 +287,9 @@ struct FilumaPaywallView: View {
                     .padding(.bottom, 8)
                     .accessibilityIdentifier("pro.paywall.uiTestPurchase")
                 }
+            }
+            .task {
+                await loadProducts()
             }
             .onChange(of: proStore.isPro) { _, isPro in
                 guard isPro else { return }
@@ -310,6 +320,108 @@ struct FilumaPaywallView: View {
                 .stroke(Color.filumaBorder)
         }
         .frame(maxWidth: 560)
+    }
+
+    /// Guideline 3.1.2(c): title, length, and price must be clear before purchase.
+    private var subscriptionDisclosure: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Subscription options")
+                .font(AppFont.heading(13))
+                .foregroundStyle(Color.filumaSubtle)
+
+            ForEach(orderedProducts, id: \.id) { product in
+                HStack(alignment: .firstTextBaseline) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(product.displayName)
+                            .font(AppFont.bodySemibold(13))
+                            .foregroundStyle(Color.filumaText)
+                        Text(subscriptionLength(for: product))
+                            .font(AppFont.caption(12))
+                            .foregroundStyle(Color.filumaSubtle)
+                    }
+                    Spacer(minLength: 8)
+                    Text(product.displayPrice)
+                        .font(AppFont.monoMedium(13))
+                        .foregroundStyle(Color.filumaText)
+                }
+                .accessibilityElement(children: .combine)
+            }
+
+            if products.isEmpty {
+                Text("Filuma Pro Monthly · 1 month")
+                    .font(AppFont.bodySemibold(13))
+                    .foregroundStyle(Color.filumaText)
+                Text("Filuma Pro Annual · 1 year")
+                    .font(AppFont.bodySemibold(13))
+                    .foregroundStyle(Color.filumaText)
+                Text("Prices appear on the purchase buttons below once the App Store responds.")
+                    .font(AppFont.caption(12))
+                    .foregroundStyle(Color.filumaSubtle)
+            }
+
+            Text("Payment is charged to your Apple Account at confirmation. Subscriptions renew automatically unless cancelled at least 24 hours before the end of the current period. Manage or cancel anytime in Settings → Apple Account → Subscriptions.")
+                .font(AppFont.caption(11))
+                .foregroundStyle(Color.filumaFaint)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(maxWidth: 560, alignment: .leading)
+        .background(Color.filumaSurface.opacity(0.92))
+        .clipShape(RoundedRectangle(cornerRadius: FilumaRadius.card, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: FilumaRadius.card, style: .continuous)
+                .stroke(Color.filumaBorder)
+        }
+        .accessibilityIdentifier("pro.paywall.subscriptionDisclosure")
+    }
+
+    /// Explicit tappable Privacy + EULA links (in addition to SubscriptionStore policy destinations).
+    private var legalLinks: some View {
+        HStack(spacing: 16) {
+            Link("Privacy Policy", destination: FilumaLegalURLs.privacy)
+                .font(AppFont.caption(12))
+                .foregroundStyle(Color.brand300)
+                .accessibilityIdentifier("pro.paywall.privacy")
+
+            Link("Terms of Use (EULA)", destination: FilumaLegalURLs.termsOfUse)
+                .font(AppFont.caption(12))
+                .foregroundStyle(Color.brand300)
+                .accessibilityIdentifier("pro.paywall.terms")
+        }
+        .frame(maxWidth: 560)
+        .padding(.bottom, 4)
+    }
+
+    private var orderedProducts: [Product] {
+        FilumaProProduct.all.compactMap { id in
+            products.first(where: { $0.id == id })
+        }
+    }
+
+    private func subscriptionLength(for product: Product) -> String {
+        guard let period = product.subscription?.subscriptionPeriod else {
+            return product.id == FilumaProProduct.annual ? "1 year" : "1 month"
+        }
+        switch period.unit {
+        case .day:
+            return period.value == 1 ? "1 day" : "\(period.value) days"
+        case .week:
+            return period.value == 1 ? "1 week" : "\(period.value) weeks"
+        case .month:
+            return period.value == 1 ? "1 month" : "\(period.value) months"
+        case .year:
+            return period.value == 1 ? "1 year" : "\(period.value) years"
+        @unknown default:
+            return product.id == FilumaProProduct.annual ? "1 year" : "1 month"
+        }
+    }
+
+    private func loadProducts() async {
+        do {
+            products = try await Product.products(for: FilumaProProduct.all)
+        } catch {
+            products = []
+        }
     }
 
     private func benefit(_ text: String, icon: String) -> some View {

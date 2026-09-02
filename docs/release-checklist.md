@@ -1,4 +1,4 @@
-# Filuma — TestFlight / App Store submission checklist
+# Filuma â TestFlight / App Store submission checklist
 
 State as of 2026-08-23 (v1.3.0, build 6). Checked items below were verified
 against frozen compiled-input fingerprint
@@ -24,7 +24,7 @@ distribution signing, or a physical-device pass.
       at least 44-point interaction targets without replacing the Hearth style.
 - [x] Tasks, Settings, and Weave use centered readable-width content on iPad;
       the custom bottom bar is capped while Schedule retains the wider canvas.
-- [x] Onboarding is a three-stage welcome → day → block setup with a one-tap
+- [x] Onboarding is a three-stage welcome â day â block setup with a one-tap
       recommended-defaults path. Its actions remain fixed and reachable on
       short windows, Accessibility 5, and iPad landscape, and it honors Reduce
       Motion.
@@ -52,17 +52,17 @@ distribution signing, or a physical-device pass.
       dark card surface, clearing normal-text contrast guidance.
 - [x] `ITSAppUsesNonExemptEncryption = NO` is declared in the app plist.
 
-## Blockers — do before submitting
+## Blockers â do before submitting
 
-- [ ] **App name: “Filuma” chosen 2026-07-18** (the original name, “Loom,” was
-      not available). The full rename shipped the same day — bundle IDs
+- [ ] **App name: âFilumaâ chosen 2026-07-18** (the original name, âLoom,â was
+      not available). The full rename shipped the same day â bundle IDs
       (`com.christoforakis.Filuma` / `.FilumaWidgets`), App Group, keychain
       service, `filuma://` URL scheme, notification category IDs, store
       filename, and all user-facing copy. Remaining human steps:
-      - Reserve the name “Filuma” in App Store Connect and run a trademark
+      - Reserve the name âFilumaâ in App Store Connect and run a trademark
         search to confirm availability.
-      - **Google OAuth client**: build 6 reaches Google's branded “Sign in to
-        continue to Filuma” page and Google displays Filuma's Privacy Policy and
+      - **Google OAuth client**: build 6 reaches Google's branded âSign in to
+        continue to Filumaâ page and Google displays Filuma's Privacy Policy and
         Terms of Service links, proving the current client ID and redirect enter
         a valid Filuma OAuth flow. Google Cloud Console must still confirm that
         the iOS client's registered bundle ID is
@@ -72,9 +72,9 @@ distribution signing, or a physical-device pass.
         `group.com.christoforakis.Filuma` (automatic signing will offer this on
         the next signed build; confirm provisioning for both targets).
       - Dev devices only: pre-rename installs used the old identifiers, so the
-        old “Loom” Apple calendar and Google events tagged `private.loom=1`
+        old âLoomâ Apple calendar and Google events tagged `private.loom=1`
         will not be recognized by the renamed app. No public users exist, so
-        no migration shim is needed — delete the old install and calendar.
+        no migration shim is needed â delete the old install and calendar.
 - [x] **Support and Privacy Policy URLs are live.** On 2026-08-23,
       `https://sparkbiscuit.me/` and `https://sparkbiscuit.me/privacy/` both
       returned HTTP 200 over HTTPS. Enter and re-check these exact URLs in App
@@ -84,7 +84,7 @@ distribution signing, or a physical-device pass.
       direct optional Calendar transmission, and accurately describes local,
       Keychain, backup, and exported-calendar deletion behavior. The corrected
       page was deployed and returned HTTP 200 on 2026-08-23.
-- [x] **Add the Privacy Policy link inside the app.** Settings → About now
+- [x] **Add the Privacy Policy link inside the app.** Settings â About now
       links to `https://sparkbiscuit.me/privacy/` (added 2026-07-18).
 - [ ] **Choose and implement the subscription product before charging.** The
       repository currently contains no StoreKit products, entitlement source
@@ -111,16 +111,16 @@ distribution signing, or a physical-device pass.
       complete. In Testing mode only allow-listed accounts can sign in. Supply
       App Review with a working demo account or precise review instructions for
       the optional integration.
-- [ ] **App Privacy label** (App Store Connect → App Privacy): answer
+- [ ] **App Privacy label** (App Store Connect â App Privacy): answer
       accurately for the submitted binary and published policy. Local
       SwiftData, Apple framework processing, and transient OAuth requests do
       not by themselves require disclosure, but optional Google Calendar export
       writes task-derived work-block content to the user's Google account on an
       ongoing basis. Apple's current definition and optional-disclosure rules
-      make **Other User Content — linked to the user — App Functionality — not
+      make **Other User Content â linked to the user â App Functionality â not
       tracking** the conservative answer. See
-      `docs/app-store-privacy-disclosure.md`; do not attest “Data Not
-      Collected.”
+      `docs/app-store-privacy-disclosure.md`; do not attest âData Not
+      Collected.â
 - [ ] **Age rating questionnaire**: answer for the exact submitted product and
       marketing copy. Do not assume 4+ if the listing frames Filuma as ADHD or
       health/wellness support; use the rating App Store Connect derives from
@@ -128,7 +128,7 @@ distribution signing, or a physical-device pass.
 - [x] **Capture required screenshots**: build 6 iPhone screenshots plus the
       required **13-inch iPad** set because the app ships natively to iPad.
       The curated sets are preserved under `AppStoreAssets/1.3.0-build6` at
-      1242×2688 and 2064×2752. The iPad compositions are native layouts rather
+      1242Ã2688 and 2064Ã2752. The iPad compositions are native layouts rather
       than scaled phone captures.
 - [ ] **Physical-device capability pass**: install an archive-signed build and
       verify the shared SwiftData store/App Group across the app and widget,
@@ -136,7 +136,7 @@ distribution signing, or a physical-device pass.
       Lock Screen and Dynamic Island, local notifications, speech, and Calendar
       permissions. Confirm App Group provisioning for both bundle identifiers.
 - [ ] **Export compliance**: already answered in code
-      (`ITSAppUsesNonExemptEncryption = NO`) — TestFlight should not ask.
+      (`ITSAppUsesNonExemptEncryption = NO`) â TestFlight should not ask.
       If Connect still asks, answer "standard encryption only / exempt."
 
 ## App Store Connect metadata
@@ -151,7 +151,7 @@ distribution signing, or a physical-device pass.
       the in-app link and actual submitted behavior.
 - [ ] Screenshots: 6.9" iPhone required; **iPad 13" also required because the
       app ships to iPad** (`TARGETED_DEVICE_FAMILY = 1,2`). Take iPad
-      screenshots seriously — reviewers test on iPad (Guideline 2.4.1).
+      screenshots seriously â reviewers test on iPad (Guideline 2.4.1).
 - [ ] Age rating questionnaire, using the derived rating from truthful answers
       rather than targeting a predetermined rating.
 
@@ -161,6 +161,12 @@ distribution signing, or a physical-device pass.
 Filuma is fully usable without an account or login. Sign-in required should remain OFF.
 
 Google Calendar sync is optional and not required to review core features (tasks, scheduling, Focus, Weave, widgets). No demo account is needed for the main app. If you choose to test Google Calendar, use any Google account; Filuma requests calendar.events access only after the reviewer taps Connect Google Calendar in Settings.
+
+How to reach Filuma Pro / the purchase UI:
+1. Skip or complete onboarding with defaults.
+2. Create three active tasks (Capture / +).
+3. Attempt a fourth active task, or open Settings → Filuma Pro → Unlock Filuma Pro.
+4. On the paywall, confirm monthly and annual title, length, and price; tap Privacy Policy and Terms of Use (EULA); Restore Purchases is available.
 
 Filuma Pro is an auto-renewable subscription (monthly and annual). The paywall shows subscription title, length, and price before purchase, plus functional Privacy Policy and Terms of Use (EULA) links. Restore Purchases is available on the paywall and in Settings.
 
@@ -176,18 +182,18 @@ Terms of Use (Apple Standard EULA): https://www.apple.com/legal/internet-service
       windows) touching all four tabs.
 - [ ] One physical-device App Group/widget/Live Activity pass, including pause
       and resume while the app is backgrounded and the screen is locked.
-- [ ] Launch from a cold start — should now open on the dark Hearthlight
+- [ ] Launch from a cold start â should now open on the dark Hearthlight
       background (no white flash).
 
 ## Deliberate decisions (documented so nobody "fixes" them)
 
-- **No Sign in with Apple**: not required — Google OAuth is a data
+- **No Sign in with Apple**: not required â Google OAuth is a data
   integration, not an account system (Guideline 4.8 does not apply).
 - **Dark-only appearance**: locked via `.preferredColorScheme(.dark)`;
   consistent and HIG-acceptable as a deliberate design.
 - **Optional onboarding**: the three-stage flow requests no permissions,
-  existing users bypass it, and first-time users can choose “Start with
-  defaults” without opening the schedule editors.
+  existing users bypass it, and first-time users can choose âStart with
+  defaultsâ without opening the schedule editors.
 
 ## Follow-ups worth considering (not release-gating)
 
@@ -205,7 +211,7 @@ Terms of Use (Apple Standard EULA): https://www.apple.com/legal/internet-service
   tests comprehensively exercise the live schema but do not yet prove an
   upgrade from a historical store file.
 
-## Frozen verification artifacts — 2026-08-23
+## Frozen verification artifacts â 2026-08-23
 
 - Units: `/tmp/Filuma-frozen-units.Oq8spL/FilumaUnits.xcresult`
 - Phone UI: `/tmp/filuma-authoritative-phone.1YnuMz/Filuma-phone-ui.xcresult`

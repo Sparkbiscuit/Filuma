@@ -377,6 +377,11 @@ struct WorkSessionView: View {
                 }
 
                 if isRunning, let end = blockEndTarget {
+                    // The ring counts down a reservation; tracked effort stays
+                    // visible separately, including after that block ends.
+                    Text("\(CountdownFormatter.timerString(seconds: elapsedSeconds)) focused")
+                        .font(AppFont.monoMedium(12))
+                        .foregroundStyle(Color.filumaSubtle)
                     Text(blockBoundaryLabel(end: end))
                         .font(AppFont.monoMedium(12))
                         .foregroundStyle(Color.filumaFaint)
@@ -384,18 +389,30 @@ struct WorkSessionView: View {
                 }
             }
             .padding(.top, 28)
+
+            Text("Focus now.\nA richer tomorrow.")
+                .font(AppFont.body(13))
+                .foregroundStyle(Color.filumaSubtle)
+                .multilineTextAlignment(.center)
+                .padding(.top, 20)
         }
         .padding(.bottom, 24)
     }
 
-    /// The 200pt held-flame ring: pulsing halo, conic accent arc, inner dark
+    /// The held-flame ring: pulsing halo, conic accent arc, inner dark
     /// disc carrying the big mono timer and a breathing status label.
+    @ViewBuilder
     private var heldFlameRing: some View {
+        if dynamicTypeSize.isAccessibilitySize {
+            timerReadout
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 24)
+        } else {
         ZStack {
             HearthProgressRing(
                 progress: ringProgress,
-                size: 200,
-                lineWidth: 13,
+                size: 236,
+                lineWidth: 7,
                 showsHalo: isRunning && !isPaused && !hasBlockEnded
             )
 
@@ -410,13 +427,21 @@ struct WorkSessionView: View {
                     )
                 )
                 .overlay(Circle().stroke(Color.filumaBorder, lineWidth: 1))
-                .frame(width: 168, height: 168)
+                .frame(width: 218, height: 218)
 
+            timerReadout
+
+        }
+        .frame(width: 268, height: 268)
+        }
+    }
+
+    private var timerReadout: some View {
             VStack(spacing: 8) {
                 Text(primaryTimerLabel)
-                    .font(AppFont.mono(38))
+                    .font(.system(.largeTitle, design: .rounded, weight: .medium).monospacedDigit())
                     .foregroundStyle(isRunning && !isPaused ? Color.filumaText : Color.filumaSubtle)
-                    .contentTransition(.numericText())
+                    .contentTransition(reduceMotion ? .opacity : .numericText())
                     .lineLimit(1)
                     .minimumScaleFactor(0.6)
 
@@ -430,18 +455,11 @@ struct WorkSessionView: View {
                         .kerning(2)
                 }
 
-                if isRunning {
-                    Text("\(CountdownFormatter.timerString(seconds: elapsedSeconds)) focused")
-                        .font(AppFont.monoMedium(11))
-                        .foregroundStyle(Color.filumaFaint)
-                }
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(statusLabel.capitalized)
             .accessibilityValue(timerAccessibilityValue)
             .accessibilityIdentifier("workSession.timer")
-        }
-        .frame(width: 244, height: 244)
     }
 
     // MARK: - Fixed actions
@@ -702,7 +720,7 @@ struct WorkSessionView: View {
         if !isRunning { return "READY" }
         if isPaused { return "PAUSED" }
         if hasBlockEnded { return "BLOCK ENDED" }
-        if blockEndTarget != nil { return "BLOCK LEFT" }
+        if blockEndTarget != nil { return "REMAINING" }
         return "FOCUSED"
     }
 
@@ -1122,7 +1140,8 @@ struct WorkSessionView: View {
             do {
                 try PlanCoordinator.reconcileTaskAfterAttendance(
                     task,
-                    context: modelContext
+                    context: modelContext,
+                    endingSessionID: activeSessionID
                 )
             } catch {
                 // Attendance itself is already durable. Keep this same session
@@ -1146,6 +1165,9 @@ struct WorkSessionView: View {
         // block. Repair those conflicts only after the session and attendance
         // above are durable, then persist the resulting plan before returning.
         do {
+            if try modelContext.fetch(FetchDescriptor<UserSettings>()).first?.planningRebuildPending == true {
+                try PlanCoordinator.rebuildPlan(context: modelContext)
+            }
             _ = try PlanCoordinator.resumeDeferredBusyTimeConflictReplan(
                 context: modelContext
             )

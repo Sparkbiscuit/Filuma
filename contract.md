@@ -33,9 +33,9 @@ gamified, or euphoric about productivity.
   `filumaBackground`, `filumaSurface*`, `filumaText`, `filumaSubtle`,
   `filumaFaint`, `filumaBorder`, `brand*`, and context colors. Screens do not
   invent local hex colors when an existing role fits.
-- Type comes from `AppFont`. Nunito carries warmth and hierarchy;
-  JetBrains Mono is reserved for time, quantities, and compact status—not body
-  copy or decorative technical flavor.
+- Type comes from `AppFont`. Native serif display titles carry warmth; SF
+  body styles provide optical sizing and Dynamic Type. Monospaced digits are
+  reserved for time and quantities.
 - Corners come from `FilumaRadius`; readable widths come from `FilumaLayout`.
   Repetition should produce rhythm, not a wall of identical floating capsules.
 - Standard screen atmosphere comes from `HearthScreenBackground`/`hearthScreen`.
@@ -70,8 +70,8 @@ gamified, or euphoric about productivity.
 ## Screen signatures
 
 - Tasks empty: one luminous first-thread tableau and one invitation to begin.
-- Tasks populated: Focus → thread continuity → Library; no duplicate priority
-  labels competing with the hero.
+- Today populated: landscape → current session → connected upcoming sessions
+  → Library. The session itself leads, without a duplicate Focus heading.
 - Schedule: time is spatial and truthful, including overnight continuity.
 - Work Session: the timer is the quiet center; controls remain fixed, reachable,
   and recoverable after persistence failures.
@@ -79,8 +79,9 @@ gamified, or euphoric about productivity.
   commit surface, validation adjacent to the relevant field.
 - Completion: a deterministic knot/seal ritual built from native shapes, with
   Done and Undo always available.
-- Weave: a single tactile tapestry surface for reflection—not fourteen tiny
-  pseudo-controls or a dashboard of invented metrics.
+- Weave: one adjustable tapestry surface with context-colored strands and knots
+  sized by recorded effort. Horizontal position represents date; vertical travel
+  expresses weaving, not a value axis. The selected period controls its totals.
 
 ## Forbidden defaults
 
@@ -99,3 +100,22 @@ A slice is complete only when it builds, preserves durable data semantics,
 passes its focused unit/UI journeys, survives Accessibility 5 and iPad
 landscape where applicable, honors Reduce Motion, and passes the Hallmark
 slop test without weakening a failing accessibility gate.
+
+
+## Distributed work update
+
+The user's September 2026 concept board updates the earlier type direction.
+Keep the ember, warm landscape, native interactions, and visible continuity.
+Light appearance follows the system and uses darker semantic foregrounds.
+
+Reserve achievable capacity before improving spacing. Prefer distinct days and
+separated sessions before the Safe Zone, then use the actual deadline window.
+Safe Zone is a preference, not a hard cutoff. Existing saved buffers remain;
+new users start with one day. An explicit task override of zero means None.
+Completed work, valid locks, active timers, availability, daily limits, and
+user-selected earliest starts remain constraints. Unchanged automatic refreshes
+must preserve session identities and dates.
+
+Plan copy comes from actual reservations. Do not claim an early finish when
+some remaining effort lacks coverage. Connect sessions belonging to the same
+task in the preview; context color alone never implies shared task identity.

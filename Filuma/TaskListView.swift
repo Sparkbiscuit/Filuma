@@ -85,6 +85,9 @@ struct TaskListView: View {
                         focusSection
                         librarySection
                     }
+                    .background(alignment: .top) {
+                        TodayLandscape().frame(height: 310)
+                    }
                     .padding(.bottom, min(navigationDockClearance, 300))
                     .frame(maxWidth: FilumaLayout.readableContentMaxWidth)
                     .frame(maxWidth: .infinity)
@@ -184,7 +187,12 @@ struct TaskListView: View {
                 Text(greeting)
                     .font(AppFont.caption(13))
                     .foregroundStyle(Color.brand300)
-                HearthTitle(text: "Your Tasks", size: 32)
+                Text("Today")
+                    .font(AppFont.display(36))
+                    .foregroundStyle(Color.filumaText)
+                Text(Date.now, format: .dateTime.weekday(.wide).month(.wide).day())
+                    .font(AppFont.body(13))
+                    .foregroundStyle(Color.filumaSubtle)
             }
             Spacer()
             // The flame pill counts what's alive on the loom right now.
@@ -195,7 +203,7 @@ struct TaskListView: View {
         }
         .padding(.horizontal, FilumaSpacing.screen)
         .padding(.top, 16)
-        .padding(.bottom, 8)
+        .padding(.bottom, 26)
     }
 
     private var greeting: String {
@@ -221,17 +229,14 @@ struct TaskListView: View {
             if let heroBlock = candidates.first,
                let heroTask = heroBlock.task {
                 VStack(spacing: 0) {
-                    sectionHeading(
-                        "Focus",
-                        subtitle: "The thread in front of you",
-                        identifier: "tasks.section.focus"
-                    )
                     heroSection(
                         task: heroTask,
                         block: heroBlock,
                         now: timeline.date,
                         hasFollowingBlock: candidates.count > 1
                     )
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("tasks.section.focus")
                     pushBanner
                     upNextThreadSection(blocks: Array(candidates.dropFirst().prefix(3)))
                 }
@@ -1285,7 +1290,9 @@ private struct UpNextThreadRow: View {
     }
 
     private var startTime: some View {
-        Text(TimeFormatter.clock.string(from: block.startTime))
+        Text(Calendar.current.isDateInToday(block.startTime)
+             ? TimeFormatter.clock.string(from: block.startTime)
+             : block.startTime.formatted(.dateTime.weekday(.abbreviated).hour().minute()))
             .font(AppFont.mono(12))
             .foregroundStyle(task.context.displayColor)
     }
@@ -1320,56 +1327,29 @@ private struct RightNowCard: View {
     var onPush: (BlockPushChoice) -> Void
 
     @State private var showPushOptions = false
+    @State private var showPlan = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     private var isActive: Bool { block.startTime <= now }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .center, spacing: 16) {
-                // The held flame in miniature: ring + live countdown, with the
-                // same pulsing halo as the full-size session flame.
-                ZStack {
-                    HearthProgressRing(progress: ringProgress, size: 74, lineWidth: 7, showsHalo: isActive)
-                    VStack(spacing: 0) {
-                        Text(ringCountdown)
-                            .font(AppFont.mono(15))
-                            .foregroundStyle(Color.filumaText)
-                            .contentTransition(reduceMotion ? .opacity : .numericText())
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.5)
-                        Text(isActive ? "LEFT" : "UNTIL")
-                            .font(AppFont.caption(8))
-                            .foregroundStyle(Color.brand300)
-                            .kerning(1)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.5)
-                    }
-                    .padding(.horizontal, 4)
-                }
-                .frame(width: 88, height: 88)
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(isActive ? "Time left in block" : "Time until block")
-                .accessibilityValue(ringCountdown)
-
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(isActive ? "RIGHT NOW" : "NEXT BLOCK")
+                    Text(timelineLabel)
                         .font(AppFont.caption(11))
                         .foregroundStyle(Color.brand300)
-                        .kerning(1.4)
+
                     Text(task.title)
                         .font(AppFont.cardTitle(18))
                         .foregroundStyle(Color.filumaText)
-                        .lineLimit(2)
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
                     if let step = task.firstStep, !step.isEmpty {
                         Text("First step: \(step)")
                             .font(AppFont.bodySemibold(12))
                             .foregroundStyle(Color.filumaSubtle)
-                            .lineLimit(2)
-                    } else {
-                        Text(timelineLabel)
-                            .font(AppFont.monoMedium(11))
-                            .foregroundStyle(Color.filumaSubtle)
+                            .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
                     }
                 }
                 .accessibilityElement(children: .combine)
@@ -1381,21 +1361,24 @@ private struct RightNowCard: View {
                 HStack(spacing: 8) {
                     Image(systemName: "play.fill")
                         .font(.system(size: 14, weight: .semibold))
-                    Text(isActive ? "Continue session" : "Start early")
+                    Text(isActive ? "Start" : "Start early")
                 }
                 .primaryButtonStyle()
             }
             .hearthPressStyle(scale: 0.98, pressedOpacity: 0.9)
 
-            Button {
-                showPushOptions = true
-            } label: {
-                Text("Can't right now?")
-                    .font(AppFont.caption(12))
-                    .foregroundStyle(Color.filumaSubtle)
-                    .frame(maxWidth: .infinity, minHeight: 44)
+            ViewThatFits(in: .horizontal) {
+                HStack {
+                    planButton
+                    Spacer(minLength: 12)
+                    postponeButton
+                }
+                VStack(spacing: 0) {
+                    planButton
+                    postponeButton
+                }
             }
-            .hearthPressStyle(scale: 0.98, pressedOpacity: 0.78)
+
         }
         .padding(18)
         // A soft ember pooled in the top-right corner (applied before the
@@ -1456,6 +1439,7 @@ private struct RightNowCard: View {
             }
         }
         .shadow(color: Color.brand500.opacity(0.22), radius: 30, y: 12)
+        .sheet(isPresented: $showPlan) { TaskPlanPreview(task: task) }
         .confirmationDialog("Can't right now?", isPresented: $showPushOptions, titleVisibility: .visible) {
             Button("Push 30 minutes") { onPush(.thirtyMinutes) }
             Button("Push 1 hour") { onPush(.oneHour) }
@@ -1466,43 +1450,29 @@ private struct RightNowCard: View {
         }
     }
 
-    private var elapsedFraction: Double {
-        let total = block.endTime.timeIntervalSince(block.startTime)
-        guard total > 0 else { return 0 }
-        return min(1, max(0, now.timeIntervalSince(block.startTime) / total))
+    private var planButton: some View {
+        Button("Scheduled sessions") { showPlan = true }
+            .font(AppFont.caption(12))
+            .foregroundStyle(Color.brand300)
+            .frame(minHeight: 44)
+            .buttonStyle(.plain)
     }
 
-    /// Active: how far through the block the flame has burned. Upcoming: a
-    /// faint spark so the ring never reads as empty.
-    private var ringProgress: Double {
-        isActive ? elapsedFraction : 0.03
-    }
-
-    /// mm:ss (or h:mm:ss) left in the block when active, or until it starts.
-    private var ringCountdown: String {
-        let target = isActive ? block.endTime : block.startTime
-        let seconds = max(0, Int(target.timeIntervalSince(now)))
-        if seconds >= 3600 * 10 {
-            // Far-future block: mm:ss would be absurd, show hours.
-            return "\(seconds / 3600)h"
-        }
-        return CountdownFormatter.timerString(seconds: seconds)
+    private var postponeButton: some View {
+        Button("Can't right now?") { showPushOptions = true }
+            .font(AppFont.caption(12))
+            .foregroundStyle(Color.filumaSubtle)
+            .frame(minHeight: 44)
+            .buttonStyle(.plain)
     }
 
     private var timelineLabel: String {
-        if isActive {
-            let elapsed = Int(now.timeIntervalSince(block.startTime)) / 60
-            let remaining = max(0, Int(block.endTime.timeIntervalSince(now)) / 60)
-            let elapsedPart = elapsed < 1
-                ? "Just started"
-                : "Started \(CountdownFormatter.effortString(minutes: elapsed)) ago"
-            return "\(elapsedPart) · \(CountdownFormatter.effortString(minutes: remaining)) left"
-        } else {
-            let start = CountdownFormatter.string(from: now, to: block.startTime)
-            let startPart = start == "now" ? "Starts now" : "Starts \(start)"
-            return "\(startPart) · \(CountdownFormatter.effortString(minutes: block.durationMinutes)) block"
-        }
+        let start = Calendar.current.isDateInToday(block.startTime)
+            ? TimeFormatter.clock.string(from: block.startTime)
+            : block.startTime.formatted(.dateTime.weekday(.abbreviated).hour().minute())
+        return "\(start) – \(TimeFormatter.clock.string(from: block.endTime))"
     }
+
 }
 
 // MARK: - Overdue triage row

@@ -18,6 +18,8 @@ struct TaskEditView: View {
     @State private var firstStep = ""
     @State private var context: TaskContext = .school
     @State private var deadline = Date()
+    @Query private var settingsRows: [UserSettings]
+    @State private var safeZoneMinutes: Int? = nil
     @State private var effortMinutes = 60
     @State private var earliestDeadline = Date()
     @State private var savedDraft: TaskEditDraft?
@@ -41,6 +43,7 @@ struct TaskEditView: View {
         let firstStep: String
         let context: TaskContext
         let deadline: Date
+        let safeZoneMinutes: Int?
         let effortMinutes: Int
     }
 
@@ -54,6 +57,7 @@ struct TaskEditView: View {
             firstStep: firstStep,
             context: context,
             deadline: deadline,
+            safeZoneMinutes: safeZoneMinutes,
             effortMinutes: effortMinutes
         )
     }
@@ -103,6 +107,12 @@ struct TaskEditView: View {
                             } else {
                                 taskDetailsCard
                                 planShapeCard(includesDeadline: true)
+                            }
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("Current plan")
+                                    .font(AppFont.heading(14))
+                                    .foregroundStyle(Color.filumaText)
+                                TaskDistributionView(task: task, globalSafeZoneMinutes: settingsRows.first?.deadlineBufferMinutes ?? 1440)
                             }
                         }
                         .frame(maxWidth: FilumaLayout.readableContentMaxWidth)
@@ -165,14 +175,7 @@ struct TaskEditView: View {
                 .accessibilityAddTraits(.isHeader)
                 .accessibilityIdentifier("taskEdit.title")
 
-            Text(
-                emphasizeDeadline
-                    ? "Give this work a doable place to land, then adjust anything else that changed."
-                    : "Keep the task recognizable while Filuma holds the plan around it."
-            )
-            .font(AppFont.body(12))
-            .foregroundStyle(Color.filumaSubtle)
-            .fixedSize(horizontal: false, vertical: true)
+
         }
         .padding(.horizontal, FilumaSpacing.screen)
         .padding(.top, 14)
@@ -268,6 +271,8 @@ struct TaskEditView: View {
 
             taskEditDivider
             effortPicker
+            taskEditDivider
+            SafeZonePicker(minutes: $safeZoneMinutes, globalDefault: settingsRows.first?.deadlineBufferMinutes ?? 1440)
         }
         .padding(16)
         .background(Color.filumaSurface)
@@ -578,7 +583,7 @@ struct TaskEditView: View {
             .keyboardShortcut(.defaultAction)
             .accessibilityHint(
                 isValid
-                    ? "Saves these details and rebuilds the schedule if the deadline or effort changed."
+                    ? "Saves these details and rebuilds the schedule if the deadline, effort, or Safe Zone changed."
                     : "Resolve the validation message before saving."
             )
             .accessibilityIdentifier("taskEdit.save")
@@ -610,6 +615,7 @@ struct TaskEditView: View {
         firstStep = task.firstStep ?? ""
         context = task.context
         deadline = task.deadline
+        safeZoneMinutes = task.safeZoneMinutes
         effortMinutes = task.effortMinutes
 
         // A past deadline cannot be picked. Triage begins from a fresh, doable
@@ -655,7 +661,8 @@ struct TaskEditView: View {
                     firstStep: trimmedStep.isEmpty ? nil : trimmedStep,
                     taskContext: context,
                     deadline: deadline,
-                    effortMinutes: effortMinutes
+                    effortMinutes: effortMinutes,
+                    safeZoneMinutes: safeZoneMinutes
                 ),
                 context: modelContext,
                 now: saveTime
@@ -673,11 +680,19 @@ struct TaskEditView: View {
         // This is now the last submitted draft. A warning keeps the editor open
         // without making already-submitted values look unsaved.
         savedDraft = currentDraft
+        if settingsRows.first?.planningRebuildPending == true,
+           WorkSessionControlStore.load()?.taskID == task.id {
+            scheduleWarningTitle = "Plan refresh queued"
+            scheduleWarning = "Your changes are saved. Filuma will refresh this plan when your current session ends."
+            warningAllowsDismissal = true
+            showWarning = true
+            return
+        }
 
         switch result {
         case .partialFit(_, let unscheduledMinutes):
             // A retained locked row can begin before `now` or cross the
-            // buffered deadline. The scheduler credits only its usable
+            // actual deadline. The scheduler credits only its usable
             // overlap, even though the durable row retains its full duration.
             // Derive the truthful placed amount from the shortfall instead of
             // summing those full rows into impossible feedback.

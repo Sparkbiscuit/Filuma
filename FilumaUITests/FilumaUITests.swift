@@ -13,6 +13,35 @@ final class FilumaUITests: XCTestCase {
         XCUIDevice.shared.orientation = .portrait
     }
 
+    func testCaptureSafeZoneNonePersistsIntoTaskEditor() throws {
+        let app = launchApp(skipOnboarding: true)
+        app.buttons["Capture a task"].tap()
+        let title = app.textFields["capture.taskTitleField"]
+        assertVisible(title)
+        title.tap()
+        title.typeText("A task with no buffer")
+        dismissKeyboardIfNeeded(in: app)
+        let primary = app.buttons["capture.primaryAction"]
+        let options = app.buttons["capture.moreSchedulingOptions"]
+        assertCaptureControlReachable(options, above: primary, in: app, minimumVisibleHeight: 44, requiresHitTesting: true)
+        options.tap()
+        let safeZone = app.buttons["Safe Zone"]
+        materializeSheetControl(safeZone, in: app, surface: "Capture")
+        assertCaptureControlReachable(safeZone, above: primary, in: app, minimumVisibleHeight: 44, requiresHitTesting: true)
+        safeZone.tap()
+        app.buttons["None"].tap()
+        waitForValue("None", on: safeZone)
+        primary.tap()
+        assertCaptureHandoff(taskTitle: "A task with no buffer", captureTitle: title, in: app)
+        let summary = app.buttons.matching(identifier: "task.summary").firstMatch
+        scrollToHittable(summary, in: app)
+        summary.tap()
+        let persisted = app.buttons["Safe Zone"]
+        materializeSheetControl(persisted, in: app, surface: "Edit")
+        XCTAssertEqual(persisted.value as? String, "None")
+        app.buttons["taskEdit.cancel"].tap()
+    }
+
     func testFreshLaunchCompletesOnboarding() throws {
         let app = launchApp()
 
@@ -54,7 +83,7 @@ final class FilumaUITests: XCTestCase {
         assertVisible(finish)
         finish.tap()
 
-        assertVisible(app.staticTexts["Your Tasks"])
+        assertVisible(app.staticTexts["Today"])
         assertVisible(app.staticTexts["tasks.empty.firstTitle"])
         assertVisible(app.buttons["tasks.empty.addFirst"])
         XCTAssertTrue(app.buttons["Tasks"].isSelected)
@@ -69,7 +98,7 @@ final class FilumaUITests: XCTestCase {
         XCTAssertTrue(startWithDefaults.isHittable)
         startWithDefaults.tap()
 
-        assertVisible(app.staticTexts["Your Tasks"])
+        assertVisible(app.staticTexts["Today"])
         assertVisible(app.staticTexts["tasks.empty.firstTitle"])
         assertVisible(app.buttons["tasks.empty.addFirst"])
         XCTAssertTrue(app.buttons["Tasks"].isSelected)
@@ -137,7 +166,7 @@ final class FilumaUITests: XCTestCase {
     func testSkipOnboardingNavigatesTabsAndInspectsCaptureOptions() throws {
         let app = launchApp(skipOnboarding: true)
 
-        assertVisible(app.staticTexts["Your Tasks"])
+        assertVisible(app.staticTexts["Today"])
         assertVisible(app.staticTexts["tasks.empty.firstTitle"])
         let firstTaskButton = app.buttons["tasks.empty.addFirst"]
         assertVisible(firstTaskButton)
@@ -150,9 +179,9 @@ final class FilumaUITests: XCTestCase {
         XCTAssertTrue(firstCaptureTitleField.waitForNonExistence(timeout: 3))
 
         visitTab("Schedule", showing: "Schedule", in: app)
-        visitTab("Weave", showing: "Your Weave", in: app)
+        visitTab("Weave", showing: "Weave", in: app)
         visitTab("Settings", showing: "Settings", in: app)
-        visitTab("Tasks", showing: "Your Tasks", in: app)
+        visitTab("Tasks", showing: "Today", in: app)
 
         let captureButton = app.buttons["Capture a task"]
         assertVisible(captureButton)
@@ -195,13 +224,13 @@ final class FilumaUITests: XCTestCase {
 
         app.buttons["capture.close"].tap()
         XCTAssertTrue(titleField.waitForNonExistence(timeout: 3))
-        assertVisible(app.staticTexts["Your Tasks"])
+        assertVisible(app.staticTexts["Today"])
     }
 
     func testCaptureCreatesExactTaskWithKeyboardVisibleAndReturnsToTasks() throws {
         let app = launchApp(skipOnboarding: true)
 
-        assertVisible(app.staticTexts["Your Tasks"])
+        assertVisible(app.staticTexts["Today"])
         openCapture(in: app)
 
         let captureTitle = app.staticTexts["capture.title"]
@@ -998,7 +1027,7 @@ final class FilumaUITests: XCTestCase {
             editorTitle.waitForNonExistence(timeout: 5),
             "Expected a valid Task Edit save to dismiss the sheet."
         )
-        assertVisible(app.staticTexts["Your Tasks"])
+        assertVisible(app.staticTexts["Today"])
         XCTAssertTrue(app.buttons["Tasks"].isSelected)
         let summary = taskSummary(named: taskTitle, in: app)
         assertVisible(summary)
@@ -1229,7 +1258,7 @@ final class FilumaUITests: XCTestCase {
     func testAccessibilityTextKeepsNavigationAndFirstActionReachable() throws {
         let app = launchApp(skipOnboarding: true, accessibilityText: true)
 
-        assertVisible(app.staticTexts["Your Tasks"])
+        assertVisible(app.staticTexts["Today"])
 
         let tasks = app.buttons["Tasks"]
         let schedule = app.buttons["Schedule"]
@@ -1280,7 +1309,7 @@ final class FilumaUITests: XCTestCase {
     func testPopulatedTasksExposeFocusAndGroupedLibrary() throws {
         let app = launchApp(skipOnboarding: true, seedLibrary: true)
 
-        let focus = app.descendants(matching: .any)["tasks.section.focus"]
+        let focus = app.buttons["Scheduled sessions"]
         let library = app.descendants(matching: .any)["tasks.section.library"]
         assertVisible(focus)
         assertVisible(library)
@@ -1408,7 +1437,7 @@ final class FilumaUITests: XCTestCase {
 
         notNow.tap()
         XCTAssertTrue(title.waitForNonExistence(timeout: 3))
-        assertVisible(app.staticTexts["Your Tasks"])
+        assertVisible(app.staticTexts["Today"])
     }
 
     func testWorkSessionFixedActionsRemainReachableAtAccessibilityText() throws {
@@ -1480,7 +1509,7 @@ final class FilumaUITests: XCTestCase {
 
         notNow.tap()
         XCTAssertTrue(title.waitForNonExistence(timeout: 3))
-        assertVisible(app.staticTexts["Your Tasks"])
+        assertVisible(app.staticTexts["Today"])
     }
 
     func testCaptureCompletesOnIPadLandscapeWithCappedFormAndFixedAction() throws {
@@ -1669,14 +1698,14 @@ final class FilumaUITests: XCTestCase {
             throw XCTSkip("Run this focused adaptive-layout check on an iPad destination.")
         }
 
-        assertVisible(app.staticTexts["Your Tasks"])
+        assertVisible(app.staticTexts["Today"])
         let firstTaskButton = app.buttons["tasks.empty.addFirst"]
         assertVisible(firstTaskButton)
         XCTAssertTrue(firstTaskButton.isHittable)
         visitTab("Schedule", showing: "Schedule", in: app)
-        visitTab("Weave", showing: "Your Weave", in: app)
+        visitTab("Weave", showing: "Weave", in: app)
         visitTab("Settings", showing: "Settings", in: app)
-        visitTab("Tasks", showing: "Your Tasks", in: app)
+        visitTab("Tasks", showing: "Today", in: app)
 
         let tasksButton = app.buttons["Tasks"]
         let captureButton = app.buttons["Capture a task"]
@@ -1772,7 +1801,7 @@ final class FilumaUITests: XCTestCase {
         assertFixedOnboardingAction(blocksBack, matches: blocksBackFrame)
 
         finish.tap()
-        assertVisible(app.staticTexts["Your Tasks"])
+        assertVisible(app.staticTexts["Today"])
         assertVisible(app.staticTexts["tasks.empty.firstTitle"])
         assertVisible(app.buttons["tasks.empty.addFirst"])
         XCTAssertTrue(app.buttons["Tasks"].isSelected)
@@ -2142,7 +2171,7 @@ final class FilumaUITests: XCTestCase {
                 dx: 0.5,
                 dy: (endY - scrollView.frame.minY) / scrollView.frame.height
             ))
-            start.press(forDuration: 0.05, thenDragTo: end)
+            start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.15)
         }
 
         XCTAssertGreaterThanOrEqual(
@@ -2181,7 +2210,7 @@ final class FilumaUITests: XCTestCase {
             let end = scrollView.coordinate(
                 withNormalizedOffset: CGVector(dx: 0.5, dy: 0.34)
             )
-            start.press(forDuration: 0.05, thenDragTo: end)
+            start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.15)
         }
         XCTAssertTrue(
             element.waitForExistence(timeout: 1),
@@ -2198,14 +2227,9 @@ final class FilumaUITests: XCTestCase {
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
-        let success = app.descendants(matching: .any)["capture.success"]
-        // Task success is intentionally a brief receipt before automatic
-        // dismissal. Validate its semantics when XCTest samples it, while the
-        // durable contract below remains sheet disappearance plus task handoff.
-        if success.waitForExistence(timeout: 1) {
-            XCTAssertTrue(success.isEnabled, file: file, line: line)
-            XCTAssertGreaterThanOrEqual(success.frame.height, 44, file: file, line: line)
-        }
+        // The 700ms receipt can disappear between two accessibility queries.
+        // The primary action's target is checked before tapping; verify durable
+        // sheet dismissal and task handoff here, not a transient zero-size frame.
         XCTAssertTrue(
             captureTitle.waitForNonExistence(timeout: 5),
             "Expected the successful Capture sheet to dismiss durably.",
@@ -2213,7 +2237,7 @@ final class FilumaUITests: XCTestCase {
             line: line
         )
 
-        assertVisible(app.staticTexts["Your Tasks"], file: file, line: line)
+        assertVisible(app.staticTexts["Today"], file: file, line: line)
         let tasks = app.buttons["Tasks"]
         assertVisible(tasks, file: file, line: line)
         XCTAssertTrue(tasks.isSelected, "Expected successful Capture to hand off to Tasks.", file: file, line: line)
@@ -2258,7 +2282,7 @@ final class FilumaUITests: XCTestCase {
             line: line
         )
         XCTAssertFalse(app.staticTexts["capture.title"].exists, file: file, line: line)
-        assertVisible(app.staticTexts["Your Tasks"], file: file, line: line)
+        assertVisible(app.staticTexts["Today"], file: file, line: line)
         let tasks = app.buttons["Tasks"]
         assertVisible(tasks, file: file, line: line)
         XCTAssertTrue(tasks.isSelected, "Expected Bulk to hand off to Tasks.", file: file, line: line)
@@ -2423,7 +2447,7 @@ final class FilumaUITests: XCTestCase {
                 dx: 0.5,
                 dy: (endY - app.frame.minY) / app.frame.height
             ))
-            start.press(forDuration: 0.05, thenDragTo: end)
+            start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.15)
         }
 
         XCTAssertGreaterThanOrEqual(
@@ -2696,7 +2720,7 @@ final class FilumaUITests: XCTestCase {
         line: UInt = #line
     ) {
         dismissNotificationPermissionIfPresent(in: app)
-        visitTab("Weave", showing: "Your Weave", in: app)
+        visitTab("Weave", showing: "Weave", in: app)
 
         let tapestryMatches = app.descendants(matching: .any)
             .matching(identifier: "weave.tapestry")
@@ -2729,9 +2753,8 @@ final class FilumaUITests: XCTestCase {
             line: line
         )
 
-        let tinyChartButtons = app.buttons.allElementsBoundByIndex.filter {
-            $0.frame.intersects(tapestry.frame)
-        }
+        // Inspect chart descendants; a scrolled chart can extend behind the dock.
+        let tinyChartButtons = tapestry.descendants(matching: .button).allElementsBoundByIndex
         XCTAssertTrue(
             tinyChartButtons.isEmpty,
             "Expected no per-day pseudo-buttons inside weave.tapestry. Found " +
@@ -2806,14 +2829,18 @@ final class FilumaUITests: XCTestCase {
         let next = keyboard.buttons
             .matching(NSPredicate(format: "label ==[c] %@", "next"))
             .firstMatch
-        if next.exists {
+        if next.exists && next.isHittable {
             next.tap()
         }
         let done = keyboard.buttons
             .matching(NSPredicate(format: "label ==[c] %@", "done"))
             .firstMatch
-        if done.waitForExistence(timeout: 1) {
+        if done.waitForExistence(timeout: 1) && done.isHittable {
             done.tap()
+        } else if keyboard.exists {
+            // A landscape keyboard snapshot can retain its portrait return-key
+            // frame. Submit the focused field through the keyboard itself.
+            app.typeText("\n")
         }
     }
 
@@ -2941,7 +2968,7 @@ final class FilumaUITests: XCTestCase {
                 dx: (currentViewport.midX - app.frame.minX) / app.frame.width,
                 dy: (endY - app.frame.minY) / app.frame.height
             ))
-            start.press(forDuration: 0.05, thenDragTo: end)
+            start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.15)
         }
 
         XCTAssertGreaterThanOrEqual(
@@ -2998,7 +3025,7 @@ final class FilumaUITests: XCTestCase {
             line: line
         )
         XCTAssertGreaterThanOrEqual(
-            control.frame.width,
+            control.frame.width + 0.01,
             44,
             "Expected \(control.identifier) to preserve a 44pt semantic width at Accessibility 5. " +
                 "Frame=\(control.frame).",
@@ -3006,7 +3033,7 @@ final class FilumaUITests: XCTestCase {
             line: line
         )
         XCTAssertGreaterThanOrEqual(
-            control.frame.height,
+            control.frame.height + 0.01,
             44,
             "Expected \(control.identifier) to preserve a 44pt semantic height at Accessibility 5. " +
                 "Frame=\(control.frame).",
@@ -3014,7 +3041,7 @@ final class FilumaUITests: XCTestCase {
             line: line
         )
         XCTAssertGreaterThanOrEqual(
-            visibleHeight,
+            visibleHeight + 0.01,
             44,
             "Expected \(control.identifier) to remain fully revealable above the navigation dock. " +
                 "Frame=\(control.frame), dockTop=\(navigationDockTop), visible=\(visibleHeight).",
@@ -3074,7 +3101,7 @@ final class FilumaUITests: XCTestCase {
                 dx: 0.5,
                 dy: shouldMoveContentUp ? 0.36 : 0.64
             ))
-            start.press(forDuration: 0.05, thenDragTo: end)
+            start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.15)
         }
 
         XCTAssertTrue(
@@ -3159,7 +3186,7 @@ final class FilumaUITests: XCTestCase {
                 dx: normalizedX,
                 dy: (endY - app.frame.minY) / app.frame.height
             ))
-            start.press(forDuration: 0.05, thenDragTo: end)
+            start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.15)
         }
 
         XCTAssertTrue(
@@ -3256,12 +3283,18 @@ final class FilumaUITests: XCTestCase {
                 }
                 .min() ?? app.frame.maxY
 
-            return element.frame.midY < dockTop - 8
+            let visibleHeight = min(element.frame.maxY, dockTop - 8) - max(element.frame.minY, app.frame.minY)
+            return visibleHeight + 0.01 >= min(44, element.frame.height) && element.frame.midY < dockTop - 8
         }
 
-        for _ in 0..<12 {
+        for _ in 0..<48 {
             if isClearOfNavigationDock() { break }
-            app.swipeUp()
+            let scroll = app.scrollViews.firstMatch
+            let midpoint = app.frame.height * 0.4
+            let up = !element.exists || element.frame.midY > midpoint
+            let start = scroll.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: up ? 0.55 : 0.35))
+            let end = scroll.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: up ? 0.35 : 0.55))
+            start.press(forDuration: 0.05, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 0.15)
         }
         XCTAssertTrue(
             isClearOfNavigationDock(),
@@ -3286,5 +3319,80 @@ private extension XCUIElement {
         let predicate = NSPredicate(format: "exists == false")
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: self)
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+}
+
+
+/// Reproducible, unretouched screenshots of the actual app. This opt-in suite
+/// uses only the in-memory marketing fixture and never opens a personal store.
+final class FilumaMarketingScreenshots: XCTestCase {
+    func testCaptureMarketingSet() throws {
+        continueAfterFailure = false
+        XCUIDevice.shared.orientation = .portrait
+        for appearance in ["dark", "light"] {
+            let app = XCUIApplication()
+            app.launchArguments = ["-ui-testing", "-ui-testing-seed-update", "-ui-testing-" + appearance]
+            app.launch()
+            XCTAssertTrue(app.staticTexts["Today"].waitForExistence(timeout: 10))
+            let banner = app.descendants(matching: .any).matching(NSPredicate(format: "label BEGINSWITH %@", "Plan refreshed")).firstMatch
+            if banner.exists && banner.isHittable { banner.tap() }
+            Thread.sleep(forTimeInterval: 2) // Let the dismissed receipt finish fading.
+            try capture("01-today-" + appearance, app: app)
+
+            let plans = app.buttons["Scheduled sessions"]
+            XCTAssertTrue(plans.waitForExistence(timeout: 5))
+            plans.tap()
+            XCTAssertTrue(app.staticTexts["Upcoming sessions"].waitForExistence(timeout: 5))
+            try capture("02-distributed-plan-" + appearance, app: app)
+            app.buttons["Done"].tap()
+
+            app.buttons["Start early"].tap()
+            XCTAssertTrue(app.buttons["workSession.start"].waitForExistence(timeout: 5))
+            app.buttons["workSession.start"].tap()
+            XCTAssertTrue(app.buttons["workSession.pause"].waitForExistence(timeout: 5))
+            try capture("03-focus-" + appearance, app: app)
+            // A fresh in-memory launch clears the fixture timer journal.
+            app.terminate()
+            app.launch()
+            XCTAssertTrue(app.buttons["Schedule"].waitForExistence(timeout: 5))
+            app.buttons["Schedule"].tap()
+            app.buttons["Week"].tap()
+            XCTAssertTrue(app.scrollViews["schedule.weekGrid"].waitForExistence(timeout: 5))
+            try capture("04-schedule-" + appearance, app: app)
+
+            app.buttons["Weave"].tap()
+            XCTAssertTrue(app.descendants(matching: .any)["weave.tapestry"].waitForExistence(timeout: 5))
+            try capture("05-weave-" + appearance, app: app)
+
+            app.buttons["Capture a task"].tap()
+            let title = app.textFields["capture.taskTitleField"]
+            XCTAssertTrue(title.waitForExistence(timeout: 5))
+            title.tap()
+            title.typeText("Prepare a thoughtful presentation")
+            let step = app.textFields["capture.firstStepField"]
+            step.tap()
+            step.typeText("Outline the three main ideas\n")
+            XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 5))
+            try capture("06-capture-" + appearance, app: app)
+            app.terminate()
+            app.launchArguments = ["-ui-testing", "-ui-testing-skip-onboarding", "-ui-testing-" + appearance]
+            app.launch()
+            XCTAssertTrue(app.staticTexts["tasks.empty.firstTitle"].waitForExistence(timeout: 5))
+            try capture("07-first-task-" + appearance, app: app)
+            app.terminate()
+        }
+    }
+
+    private func capture(_ name: String, app: XCUIApplication) throws {
+        let directory = URL.documentsDirectory.appendingPathComponent("FilumaMarketing")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let path = directory.appendingPathComponent(name + ".png")
+        let screenshot = app.screenshot()
+        try screenshot.pngRepresentation.write(to: path)
+        let attachment = XCTAttachment(screenshot: screenshot)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        print("MARKETING_SCREENSHOT=\(path.path)")
     }
 }

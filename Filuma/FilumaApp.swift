@@ -86,6 +86,7 @@ struct FilumaApp: App {
     private static let uiTestingSeedLibraryArgument = "-ui-testing-seed-library"
     private static let uiTestingSeedFreeBoundaryArgument = "-ui-testing-seed-free-boundary"
     private static let uiTestingSeedScheduleArgument = "-ui-testing-seed-schedule"
+    private static let uiTestingSeedUpdateArgument = "-ui-testing-seed-update"
     private static let uiTestingSeedOverdueArgument = "-ui-testing-seed-overdue"
 
     /// Store lives in the App Group so the widget can read it (SharedStore
@@ -150,6 +151,7 @@ struct FilumaApp: App {
             let shouldSkipOnboarding = CommandLine.arguments.contains(
                 uiTestingSkipOnboardingArgument
             )
+            let shouldSeedUpdate = CommandLine.arguments.contains(uiTestingSeedUpdateArgument)
             let shouldSeedCompletion = CommandLine.arguments.contains(
                 uiTestingSeedCompletionArgument
             )
@@ -166,6 +168,7 @@ struct FilumaApp: App {
                 uiTestingSeedOverdueArgument
             )
             if shouldSkipOnboarding
+                || shouldSeedUpdate
                 || shouldSeedCompletion
                 || shouldSeedLibrary
                 || shouldSeedFreeBoundary
@@ -176,7 +179,9 @@ struct FilumaApp: App {
                 settings.hasCompletedOnboarding = true
                 context.insert(settings)
 
-                if shouldSeedCompletion {
+                if shouldSeedUpdate {
+                    insertUpdateFixture(in: context, settings: settings)
+                } else if shouldSeedCompletion {
                     let task = FilumaTask(
                         title: "Finish launch notes",
                         context: .personal,
@@ -205,6 +210,32 @@ struct FilumaApp: App {
             return (container, false)
         } catch {
             fatalError("Filuma could not create its UI-testing model container: \(error)")
+        }
+    }
+
+    /// Only the isolated UI test store uses this authored visual QA fixture.
+    private static func insertUpdateFixture(in context: ModelContext, settings: UserSettings) {
+        let now = Date()
+        settings.maxBlockMinutes = 60
+        let task = FilumaTask(title: "Study for biochemistry exam", context: .school,
+                              deadline: now.addingTimeInterval(8 * 86400), effortMinutes: 240,
+                              firstStep: "Review last year’s exams")
+        context.insert(task)
+        for (index, item) in [("Design project", TaskContext.work), ("Read biology paper", .personal)].enumerated() {
+            context.insert(FilumaTask(title: item.0, context: item.1,
+                                     deadline: now.addingTimeInterval(Double(4 + index) * 86400), effortMinutes: 120))
+        }
+        for (index, contextType) in TaskContext.allCases.enumerated() {
+            let history = FilumaTask(title: ["Lab notes", "Project outline", "Garden plans"][index], context: contextType,
+                                     deadline: now, effortMinutes: 600)
+            history.isComplete = true
+            history.completedAt = now.addingTimeInterval(-Double(index + 1) * 86400)
+            context.insert(history)
+            for day in 0..<14 where (day + index) % 5 != 0 {
+                let date = Calendar.current.date(byAdding: .day, value: -day, to: now)!
+                context.insert(WorkSession(task: history, startedAt: date,
+                                           durationSeconds: (20 + (day * 13 + index * 17) % 60) * 60))
+            }
         }
     }
 
@@ -375,6 +406,8 @@ struct FilumaApp: App {
             // system content size. Pin ordinary tests to the default while the
             // dedicated accessibility case opts into the largest layout above.
             root.environment(\.dynamicTypeSize, .large)
+                .preferredColorScheme(CommandLine.arguments.contains("-ui-testing-light") ? .light :
+                    (CommandLine.arguments.contains("-ui-testing-dark") ? .dark : nil))
         } else {
             root
         }
@@ -418,8 +451,7 @@ struct MainTabView: View {
     var body: some View {
         rootContent
         .ignoresSafeArea(.keyboard, edges: .bottom)
-        .preferredColorScheme(.dark)
-        .tint(Color.brand500)
+        .tint(Color.brand300)
         .animation(
             reduceMotion ? nil : HearthMotion.reduced,
             value: settingsArray.first?.hasCompletedOnboarding
@@ -849,6 +881,7 @@ private struct HearthTabBar: View {
     var onSelect: (Int) -> Void
     var onCapture: () -> Void
 
+    @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -901,7 +934,7 @@ private struct HearthTabBar: View {
             )
             .stroke(Color.filumaBorder, lineWidth: 1)
         )
-        .shadow(color: .black.opacity(0.5), radius: 20, y: 8)
+        .shadow(color: .black.opacity(colorScheme == .dark ? 0.5 : 0.12), radius: 20, y: 8)
         .frame(maxWidth: FilumaLayout.tabBarMaxWidth)
         .padding(.horizontal, 20)
         .padding(.bottom, 4)

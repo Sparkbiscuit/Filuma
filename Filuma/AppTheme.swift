@@ -62,7 +62,7 @@ enum HearthAccent: String, CaseIterable, Identifiable {
 
     var baseHex: UInt32 {
         switch self {
-        case .ember: return 0xC1571F
+        case .ember: return 0xF47D36
         case .indigo: return 0x5A78E0
         case .sage: return 0x3FA372
         case .violet: return 0x8B5AD6
@@ -111,8 +111,15 @@ final class HearthTheme {
 
 extension Color {
     // Brand — derived live from the chosen hearth accent.
-    static var brand100: Color { HearthTheme.shared.accent.hi }
-    static var brand300: Color { HearthTheme.shared.accent.soft }
+    static var brand100: Color { accentForeground(dark: HearthTheme.shared.accent.hi) }
+    static var brand300: Color { accentForeground(dark: HearthTheme.shared.accent.soft) }
+    private static func accentForeground(dark: Color) -> Color {
+        let base = HearthTheme.shared.accent.baseHex
+        let light = Color.mix(base, 0x000000, keeping: 0.53)
+        return Color(uiColor: UIColor { traits in
+            UIColor(traits.userInterfaceStyle == .dark ? dark : light)
+        })
+    }
     static var brand500: Color { HearthTheme.shared.accent.color }
     static var brand600: Color { .mix(HearthTheme.shared.accent.baseHex, 0x000000, keeping: 0.86) }
     static var brand700: Color { HearthTheme.shared.accent.deep }
@@ -120,18 +127,18 @@ extension Color {
     // Semantic — urgency & task contexts (unchanged from the existing app)
     // 4.68:1 against the lightest dark card surface (#232327), so urgency
     // labels remain readable at normal text sizes without losing their warmth.
-    static let filumaRed = Color(hex: 0xEF5961)
+    static let filumaRed = Color(lightHex: 0xB52C38, darkHex: 0xEF5961)
     static let filumaRedPressed = Color(hex: 0xC93039)
     static let schoolColor = Color(hex: 0x5A78E0)
     static let workColor = Color(hex: 0xE0A020)
     static let personalColor = Color(hex: 0x3FA372)
 
     // Context display shades — lighter cousins used for text/labels on dark.
-    static let schoolDisplay = Color(hex: 0x8FA5EC)
-    static let workDisplay = Color(hex: 0xE8BE62)
-    static let personalDisplay = Color(hex: 0x6FC49A)
+    static let schoolDisplay = Color(lightHex: 0x3453A0, darkHex: 0x8FA5EC)
+    static let workDisplay = Color(lightHex: 0x765207, darkHex: 0xE8BE62)
+    static let personalDisplay = Color(lightHex: 0x216646, darkHex: 0x6FC49A)
 
-    // Surfaces (Hearthlight is dark-first; light values kept for previews)
+    // Surfaces adapt to the system appearance.
     static let filumaBackground = Color(lightHex: 0xF4F4F6, darkHex: 0x0F0F12)
     static let filumaSurface = Color(lightHex: 0xFFFFFF, darkHex: 0x19191D)
     static let filumaSurface2 = Color(lightHex: 0xEAEAEF, darkHex: 0x232327)
@@ -144,7 +151,7 @@ extension Color {
     static let filumaControlInk = Color(hex: 0x0F0F12)
     // Dark value must stay ≥ 4.5:1 against filumaBackground/filumaSurface —
     // filumaFaint is used for real content (timestamps, counts), not decoration.
-    static let filumaFaint = Color(lightHex: 0x9A9AA2, darkHex: 0x86868E)
+    static let filumaFaint = Color(lightHex: 0x686870, darkHex: 0x86868E)
 
     static let filumaBorder = Color(uiColor: UIColor { traits in
         traits.userInterfaceStyle == .dark
@@ -185,7 +192,7 @@ extension LinearGradient {
             // Both stops are deliberately light enough for filumaControlInk.
             // The old accentHi -> accent ramp made white labels fail contrast
             // for Indigo and Sage, while dark labels failed on Ember/Violet.
-            colors: [accent.hi, accent.soft],
+            colors: accent == .ember ? [accent.hi, accent.color] : [accent.hi, accent.soft],
             startPoint: .topLeading,
             endPoint: .bottomTrailing
         )
@@ -244,65 +251,58 @@ enum HearthMotion {
     static let reduced = Animation.easeOut(duration: 0.16)
 }
 
-// MARK: - Typography (Nunito + JetBrains Mono)
+// MARK: - Typography (native optical sizing and Dynamic Type)
 
 struct AppFont {
-    /// Display — Nunito ExtraBold
+    private static func style(_ size: CGFloat) -> Font.TextStyle {
+        switch size {
+        case ..<12: return .caption2
+        case ..<13: return .caption
+        case ..<15: return .footnote
+        case ..<17: return .subheadline
+        case ..<19: return .body
+        case ..<21: return .title3
+        case ..<26: return .title2
+        case ..<31: return .title
+        default: return .largeTitle
+        }
+    }
+
     static func display(_ size: CGFloat = 34) -> Font {
-        .custom("Nunito-ExtraBold", size: size, relativeTo: .largeTitle)
+        .system(style(size), design: .serif, weight: .semibold)
     }
-
-    /// Screen titles ("Your Tasks") use the heaviest cut.
     static func title(_ size: CGFloat = 28) -> Font {
-        .custom("Nunito-Black", size: size, relativeTo: .title)
+        .system(style(size), design: .serif, weight: .semibold)
     }
-
-    /// Heading — Nunito Bold
     static func heading(_ size: CGFloat = 20) -> Font {
-        .custom("Nunito-Bold", size: size, relativeTo: .headline)
+        .system(style(size), weight: .semibold)
     }
-
-    /// Card/list titles — Nunito ExtraBold
     static func cardTitle(_ size: CGFloat = 17) -> Font {
-        .custom("Nunito-ExtraBold", size: size, relativeTo: .headline)
+        .system(style(size), weight: .semibold)
     }
-
-    /// Body — Nunito Regular
     static func body(_ size: CGFloat = 16) -> Font {
-        .custom("Nunito-Regular", size: size, relativeTo: .body)
+        .system(style(size))
     }
-
-    /// Emphasized body — Nunito SemiBold
     static func bodySemibold(_ size: CGFloat = 16) -> Font {
-        .custom("Nunito-SemiBold", size: size, relativeTo: .body)
+        .system(style(size), weight: .semibold)
     }
-
-    /// Caption — Nunito Bold
     static func caption(_ size: CGFloat = 13) -> Font {
-        .custom("Nunito-Bold", size: size, relativeTo: .caption)
+        .system(style(size), weight: .medium)
     }
-
-    /// Settings section headers — Nunito ExtraBold
     static func settingsSectionHeader(_ size: CGFloat = 11) -> Font {
-        .custom("Nunito-ExtraBold", size: size, relativeTo: .caption2)
+        .system(style(size), weight: .semibold)
     }
-
-    /// Settings row labels — Nunito Bold
     static func settingsRowLabel(_ size: CGFloat = 15) -> Font {
-        .custom("Nunito-Bold", size: size, relativeTo: .subheadline)
+        .system(style(size), weight: .medium)
     }
-
-    /// Numeric/time displays — JetBrains Mono SemiBold
     static func mono(_ size: CGFloat = 14) -> Font {
-        .custom("JetBrainsMono-SemiBold", size: size, relativeTo: .body)
+        .system(style(size), weight: .semibold).monospacedDigit()
     }
-
     static func monoMedium(_ size: CGFloat = 14) -> Font {
-        .custom("JetBrainsMono-Medium", size: size, relativeTo: .body)
+        .system(style(size), weight: .medium).monospacedDigit()
     }
-
     static func monoBold(_ size: CGFloat = 14) -> Font {
-        .custom("JetBrainsMono-Bold", size: size, relativeTo: .body)
+        .system(style(size), weight: .bold).monospacedDigit()
     }
 }
 
@@ -1040,18 +1040,22 @@ struct HearthProgressRing: View {
 
         ZStack {
             if showsHalo {
-                // Two pulsing layers: a wide soft corona and a tighter core,
-                // so the held flame reads as burning rather than tinted.
+                // Fade to transparent inside the circle itself. A blurred,
+                // oversized layer can expose rectangular rendering bounds.
                 Circle()
-                    .fill(accent.color.opacity(0.3))
-                    .frame(width: size * 1.32, height: size * 1.32)
-                    .blur(radius: size * 0.16)
-                    .scaleEffect(breathing ? 1.09 : 0.92)
-                Circle()
-                    .fill(accent.color.opacity(0.2))
-                    .frame(width: size * 1.12, height: size * 1.12)
-                    .blur(radius: size * 0.08)
-                    .scaleEffect(breathing ? 1.05 : 0.96)
+                    .fill(RadialGradient(
+                        stops: [
+                            .init(color: accent.color.opacity(0.24), location: 0),
+                            .init(color: accent.color.opacity(0.12), location: 0.4),
+                            .init(color: accent.color.opacity(0.035), location: 0.7),
+                            .init(color: .clear, location: 1)
+                        ],
+                        center: .center,
+                        startRadius: size * 0.35,
+                        endRadius: size * 0.68
+                    ))
+                    .frame(width: size * 1.36, height: size * 1.36)
+                    .scaleEffect(breathing ? 1.04 : 0.96)
             }
 
             // Track
@@ -1379,4 +1383,58 @@ struct TimeFormatter {
         formatter.dateFormat = "EEE"
         return formatter
     }()
+}
+
+
+/// A quiet landscape assembled from native paths, so it stays sharp on iPad
+/// and adapts to appearance without loading an oversized decorative bitmap.
+struct TodayLandscape: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        GeometryReader { geometry in
+            let width = geometry.size.width
+            let height = geometry.size.height
+            ZStack {
+                LinearGradient(
+                    colors: [Color.filumaBackground, Color.brand700.opacity(0.52), Color.brand300.opacity(0.68)],
+                    startPoint: .top, endPoint: .bottom
+                )
+                Ellipse()
+                    .fill(Color.brand300.opacity(0.5))
+                    .frame(width: width * 0.7, height: height * 0.35)
+                    .blur(radius: 32)
+                    .position(x: width * 0.62, y: height * 0.66)
+                ForEach(0..<4) { layer in
+                    Path { path in
+                        let base = height * (0.5 + Double(layer) * 0.105)
+                        path.move(to: CGPoint(x: 0, y: height))
+                        path.addLine(to: CGPoint(x: 0, y: base - height * 0.1))
+                        var previous = CGPoint(x: 0, y: base - height * 0.1)
+                        for point in 1...9 {
+                            let x = width * CGFloat(point) / 9
+                            let valley = sin(Double(point) * 0.64) * height * 0.12
+                            let ridge = sin(Double(point * 2 + layer * 5)) * height * 0.035
+                            let next = CGPoint(x: x, y: base + valley + ridge)
+                            let middle = (previous.x + next.x) / 2
+                            path.addCurve(to: next,
+                                          control1: CGPoint(x: middle, y: previous.y),
+                                          control2: CGPoint(x: middle, y: next.y))
+                            previous = next
+                        }
+                        path.addLine(to: CGPoint(x: width, y: height))
+                        path.closeSubpath()
+                    }
+                    .fill(Color.filumaBackground.opacity(0.34 + Double(layer) * 0.2))
+                }
+                LinearGradient(
+                    colors: [.clear, Color.filumaBackground],
+                    startPoint: .center, endPoint: .bottom
+                )
+            }
+            .opacity(colorScheme == .dark ? 1 : 0.65)
+        }
+        .accessibilityHidden(true)
+        .allowsHitTesting(false)
+    }
 }

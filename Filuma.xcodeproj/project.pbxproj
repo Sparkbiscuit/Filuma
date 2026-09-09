@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A10F00032C6D3EF700D079F0 /* legacy-filuma.store in Resources */ = {isa = PBXBuildFile; fileRef = A10F00042C6D3EF700D079F0 /* legacy-filuma.store */; };
+		A10F00012C6D3EF700D079F0 /* SafeZonePersistenceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10F00022C6D3EF700D079F0 /* SafeZonePersistenceTests.swift */; };
 		021ED3012C6D3EF700D079F0 /* FilumaApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 021ED3002C6D3EF700D079F0 /* FilumaApp.swift */; };
 		021ED3072C6D3EF800D079F0 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 021ED3062C6D3EF800D079F0 /* Assets.xcassets */; };
 		021ED30B2C6D3EF800D079F0 /* Preview Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 021ED30A2C6D3EF800D079F0 /* Preview Assets.xcassets */; };
@@ -111,6 +113,8 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		A10F00042C6D3EF700D079F0 /* legacy-filuma.store */ = {isa = PBXFileReference; lastKnownFileType = file; path = Fixtures/legacy-filuma.store; sourceTree = "<group>"; };
+		A10F00022C6D3EF700D079F0 /* SafeZonePersistenceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SafeZonePersistenceTests.swift; sourceTree = "<group>"; };
 		021ED2FD2C6D3EF700D079F0 /* Filuma.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Filuma.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		021ED3002C6D3EF700D079F0 /* FilumaApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilumaApp.swift; sourceTree = "<group>"; };
 		021ED3062C6D3EF800D079F0 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
@@ -280,6 +284,8 @@
 			isa = PBXGroup;
 			children = (
 				021ED3142C6D3EF800D079F0 /* FilumaTests.swift */,
+				A10F00022C6D3EF700D079F0 /* SafeZonePersistenceTests.swift */,
+				A10F00042C6D3EF700D079F0 /* legacy-filuma.store */,
 				0CAF00542D6D3EF700D079F0 /* GoogleCalendarTests.swift */,
 			);
 			path = FilumaTests;
@@ -469,6 +475,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A10F00032C6D3EF700D079F0 /* legacy-filuma.store in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -539,6 +546,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				021ED3152C6D3EF800D079F0 /* FilumaTests.swift in Sources */,
+				A10F00012C6D3EF700D079F0 /* SafeZonePersistenceTests.swift in Sources */,
 				0CAF00552D6D3EF700D079F0 /* GoogleCalendarTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -709,7 +717,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Filuma/Filuma.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 10;
 				DEVELOPMENT_ASSET_PATHS = "\"Filuma/Preview Content\"";
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -727,7 +735,7 @@
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
-				MARKETING_VERSION = 1.3.0;
+				MARKETING_VERSION = 1.4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.christoforakis.Filuma;
 				PRODUCT_NAME = Filuma;
 				SDKROOT = auto;
@@ -747,7 +755,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Filuma/Filuma.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 10;
 				DEVELOPMENT_ASSET_PATHS = "\"Filuma/Preview Content\"";
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -765,7 +773,7 @@
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
-				MARKETING_VERSION = 1.3.0;
+				MARKETING_VERSION = 1.4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.christoforakis.Filuma;
 				PRODUCT_NAME = Filuma;
 				SDKROOT = auto;
@@ -784,11 +792,11 @@
 				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 10;
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
-				MARKETING_VERSION = 1.3.0;
+				MARKETING_VERSION = 1.4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.christoforakis.FilumaTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
@@ -806,11 +814,11 @@
 				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 10;
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
-				MARKETING_VERSION = 1.3.0;
+				MARKETING_VERSION = 1.4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.christoforakis.FilumaTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
@@ -827,11 +835,11 @@
 			buildSettings = {
 				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 10;
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
-				MARKETING_VERSION = 1.3.0;
+				MARKETING_VERSION = 1.4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.christoforakis.FilumaUITests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
@@ -848,11 +856,11 @@
 			buildSettings = {
 				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 10;
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
-				MARKETING_VERSION = 1.3.0;
+				MARKETING_VERSION = 1.4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.christoforakis.FilumaUITests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
@@ -869,7 +877,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = FilumaWidgets/FilumaWidgets.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 10;
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = FilumaWidgets/Info.plist;
@@ -879,7 +887,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.3.0;
+				MARKETING_VERSION = 1.4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.christoforakis.Filuma.FilumaWidgets;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;
@@ -896,7 +904,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = FilumaWidgets/FilumaWidgets.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 9;
+				CURRENT_PROJECT_VERSION = 10;
 				DEVELOPMENT_TEAM = 8G2SF9YU87;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = FilumaWidgets/Info.plist;
@@ -906,7 +914,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 1.3.0;
+				MARKETING_VERSION = 1.4.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.christoforakis.Filuma.FilumaWidgets;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = auto;

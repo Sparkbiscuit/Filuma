@@ -162,6 +162,7 @@ struct TaskEditUpdate: Equatable {
     let taskContext: TaskContext
     let deadline: Date
     let effortMinutes: Int
+    var safeZoneMinutes: Int? = nil
 }
 
 enum TaskEditCoordinatorError: LocalizedError, Equatable {
@@ -230,6 +231,7 @@ enum CaptureCoordinator {
         taskContext: TaskContext,
         deadline: Date,
         effortMinutes: Int,
+        safeZoneMinutes: Int? = nil,
         preferredStart: Date? = nil,
         now: Date = Date(),
         context: ModelContext,
@@ -246,8 +248,10 @@ enum CaptureCoordinator {
             context: taskContext,
             deadline: deadline,
             effortMinutes: effortMinutes,
-            firstStep: trimmedStep.isEmpty ? nil : trimmedStep
+            firstStep: trimmedStep.isEmpty ? nil : trimmedStep,
+            safeZoneMinutes: safeZoneMinutes
         )
+        task.earliestStart = preferredStart
         let start = preferredStart.map { max($0, now) }
             ?? now.addingTimeInterval(TimeInterval(input.settings.startBufferMinutes * 60))
         let result = SchedulerService.schedule(
@@ -608,6 +612,7 @@ enum CaptureCoordinator {
             context: task.context,
             effortMinutes: task.effortMinutes,
             firstStep: task.firstStep,
+            safeZoneMinutes: task.safeZoneMinutes,
             nextDeadline: nextDeadline,
             repeatUntil: repeatWeeklyUntil
         )
@@ -839,11 +844,13 @@ enum PlanCoordinator {
 
         let needsReplan = update.deadline != task.deadline
             || update.effortMinutes != task.effortMinutes
+            || update.safeZoneMinutes != task.safeZoneMinutes
 
         let originalTitle = task.title
         let originalFirstStep = task.firstStep
         let originalContext = task.context
         let originalDeadline = task.deadline
+        let originalSafeZoneMinutes = task.safeZoneMinutes
         let originalEffortMinutes = task.effortMinutes
         let originalUserModified = task.userModified
         let originalTaskBlocks = task.scheduledBlocks
@@ -883,6 +890,7 @@ enum PlanCoordinator {
                 task.firstStep = (trimmedStep?.isEmpty == false) ? trimmedStep : nil
                 task.context = update.taskContext
                 task.deadline = update.deadline
+                task.safeZoneMinutes = update.safeZoneMinutes.map { max(0, $0) }
                 task.effortMinutes = update.effortMinutes
                 task.userModified = true
 
@@ -906,6 +914,7 @@ enum PlanCoordinator {
             task.firstStep = originalFirstStep
             task.context = originalContext
             task.deadline = originalDeadline
+            task.safeZoneMinutes = originalSafeZoneMinutes
             task.effortMinutes = originalEffortMinutes
             task.userModified = originalUserModified
             task.scheduledBlocks = originalTaskBlocks
@@ -958,9 +967,7 @@ enum PlanCoordinator {
         settings: UserSettings,
         now: Date = Date()
     ) -> ScheduleResult {
-        let windowEnd = task.deadline.addingTimeInterval(
-            -Double(settings.deadlineBufferMinutes) * 60
-        )
+        let windowEnd = task.deadline
         let retainedLocked = allBlocks.filter {
             $0.task?.id == task.id
                 && $0.isLocked
@@ -1015,6 +1022,7 @@ enum PlanCoordinator {
         from startDate: Date? = nil,
         now: Date = Date(),
         interactive: Bool = true,
+        endingSessionID: UUID? = nil,
         save: @MainActor (ModelContext) throws -> Void = { try $0.save() },
         publish: @MainActor (ModelContext, Bool) -> Void = { context, interactive in
             PlanCoordinator.publishChange(context: context, interactive: interactive)
@@ -1033,6 +1041,7 @@ enum PlanCoordinator {
         let originalCompletedAt = task.completedAt
         let originalProgress = task.manualProgressPercent
         let originalTaskBlocks = task.scheduledBlocks
+        let originalEarliestStart = task.earliestStart
         var result: ScheduleResult = .noSlots
 
         do {
@@ -1040,6 +1049,7 @@ enum PlanCoordinator {
                 if existingSettings == nil {
                     context.insert(settings)
                 }
+                if let startDate { task.earliestStart = startDate }
                 result = SchedulerService.reschedule(
                     task: task,
                     allBlocks: allBlocks,
@@ -1048,12 +1058,14 @@ enum PlanCoordinator {
                     settings: settings,
                     from: startDate,
                     now: now,
-                    context: context
+                    context: context,
+                    endingSessionID: endingSessionID
                 )
                 try save(context)
             }
         } catch {
             context.rollback()
+            task.earliestStart = originalEarliestStart
             repairHeldTaskAfterRollback(
                 task,
                 isComplete: originalIsComplete,
@@ -1134,6 +1146,7 @@ enum PlanCoordinator {
         _ task: FilumaTask,
         context: ModelContext,
         now: Date = Date(),
+        endingSessionID: UUID? = nil,
         save: @MainActor (ModelContext) throws -> Void = { try $0.save() },
         publish: @MainActor (ModelContext) -> Void = { context in
             PlanCoordinator.publishChange(context: context)
@@ -1143,6 +1156,7 @@ enum PlanCoordinator {
             task,
             context: context,
             now: now,
+            endingSessionID: endingSessionID,
             save: save,
             publish: { context, _ in publish(context) }
         )
@@ -1702,7 +1716,7 @@ enum PlanCoordinator {
                     settings: settings,
                     context: context
                 )
-                settings.planningRebuildPending = false
+                settings.planningRebuildPending = tasks.contains { $0.id == WorkSessionControlStore.load()?.taskID }
                 try save(context)
             }
         } catch {

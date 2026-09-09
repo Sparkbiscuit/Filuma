@@ -85,11 +85,12 @@ struct WeaveView: View {
     @Query private var blocks: [ScheduledBlock]
 
     @State private var selectedDay: WeaveDay?
+    @State private var period = 14
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
-    private static let columnHeight: CGFloat = 130
+    private static let columnHeight: CGFloat = 260
 
     var body: some View {
         NavigationStack {
@@ -112,24 +113,24 @@ struct WeaveView: View {
     }
 
     private var days: [WeaveDay] {
-        WeaveBuilder.days(sessions: sessions, blocks: blocks, daysBack: 14)
+        WeaveBuilder.days(sessions: sessions, blocks: blocks, daysBack: period)
     }
 
     // MARK: Header
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("Two weeks of showing up")
+            Text("Your effort, over time")
                 .font(AppFont.caption(13))
                 .foregroundStyle(Color.brand300)
-            Text("Your Weave")
+            Text("Weave")
                 .font(AppFont.title(30))
                 .foregroundStyle(Color.filumaText)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, FilumaSpacing.screen)
         .padding(.top, 16)
-        .padding(.bottom, 12)
+        .padding(.bottom, 20)
     }
 
     // MARK: Tapestry
@@ -139,8 +140,24 @@ struct WeaveView: View {
         let hasAnyThread = days.contains { $0.totalMinutes > 0 }
 
         return VStack(alignment: .leading, spacing: 12) {
+            if let first = days.first, let last = days.last {
+                Text("\(first.date.formatted(.dateTime.month(.abbreviated).day())) – \(last.date.formatted(.dateTime.month(.abbreviated).day()))")
+                    .font(AppFont.body(14))
+                    .foregroundStyle(Color.filumaSubtle)
+            }
+            Picker("Time period", selection: $period) {
+                Text("Week").tag(7)
+                Text("2 Weeks").tag(14)
+                Text("Month").tag(30)
+            }
+            .pickerStyle(.segmented)
+            .onChange(of: period) { _, _ in selectedDay = nil }
             if hasAnyThread {
                 tapestry(days: days)
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 18) { contextLegend }
+                    VStack(alignment: .leading, spacing: 8) { contextLegend }
+                }
 
                 if let day = selectedDay {
                     Text(detailLine(for: day))
@@ -148,7 +165,7 @@ struct WeaveView: View {
                         .foregroundStyle(Color.filumaSubtle)
                         .transition(.opacity)
                 } else {
-                    Text("Tap a day to read its thread. Rest days hold the cloth together.")
+                    Text("Each colored knot is recorded effort. Tap a day to see its detail.")
                         .font(AppFont.caption(11))
                         .foregroundStyle(Color.filumaFaint)
                 }
@@ -166,17 +183,9 @@ struct WeaveView: View {
     }
 
     private func tapestry(days: [WeaveDay]) -> some View {
-        let maxTotal = max(days.map(\.totalMinutes).max() ?? 0, 1)
-
         return VStack(spacing: 6) {
             GeometryReader { geometry in
-                HStack(alignment: .bottom, spacing: 5) {
-                    ForEach(days) { day in
-                        dayColumn(day, maxTotal: maxTotal)
-                            .frame(maxWidth: .infinity)
-                            .accessibilityHidden(true)
-                    }
-                }
+                wovenThreads(days: days)
                 .frame(width: geometry.size.width, height: Self.columnHeight + 10)
                 .contentShape(Rectangle())
                 .gesture(
@@ -203,7 +212,7 @@ struct WeaveView: View {
             // pseudo-buttons. Touch selects the nearest day anywhere in the
             // generous plot; assistive technologies scrub the same sequence.
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Two week weave")
+            .accessibilityLabel("\(period) day weave")
             .accessibilityValue(chartAccessibilityValue(days: days))
             .accessibilityHint("Swipe up or down to read each day")
             .accessibilityAdjustableAction { direction in
@@ -214,7 +223,7 @@ struct WeaveView: View {
 
             HStack(spacing: 5) {
                 ForEach(days) { day in
-                    Text(weekdayLetter(day.date))
+                    Text(period == 30 ? (Calendar.current.component(.day, from: day.date).isMultiple(of: 5) ? day.date.formatted(.dateTime.day()) : "") : weekdayLetter(day.date))
                         .font(AppFont.caption(9))
                         .foregroundStyle(
                             Calendar.current.isDateInToday(day.date)
@@ -225,6 +234,15 @@ struct WeaveView: View {
                 }
             }
             .accessibilityHidden(true)
+        }
+    }
+
+    @ViewBuilder private var contextLegend: some View {
+        ForEach(TaskContext.allCases) { context in
+            HStack(spacing: 6) {
+                Circle().fill(context.color).frame(width: 6, height: 6)
+                Text(context.rawValue).font(AppFont.caption(11)).foregroundStyle(Color.filumaSubtle)
+            }
         }
     }
 
@@ -267,72 +285,68 @@ struct WeaveView: View {
         return "No day selected. \(CountdownFormatter.effortString(minutes: totalMinutes)) woven across \(days.count) days."
     }
 
-    /// The warp behind the weft: fine grid lines the cloth hangs on
-    /// (horizontal every 9pt, vertical every 12pt, per the prototype).
-    private func grid(color: Color) -> some View {
-        Canvas { context, size in
-            var x: CGFloat = 0
-            while x <= size.width {
-                context.stroke(
-                    Path { $0.move(to: CGPoint(x: x, y: 0)); $0.addLine(to: CGPoint(x: x, y: size.height)) },
-                    with: .color(color), lineWidth: 1
-                )
-                x += 12
+    /// Knots encode recorded minutes; the fine connecting strand communicates
+    /// continuity, not unrecorded work on intervening days.
+    private func wovenThreads(days: [WeaveDay]) -> some View {
+        Canvas { drawing, size in
+            guard !days.isEmpty else { return }
+            let step = size.width / CGFloat(days.count)
+            let maxMinutes = max(days.flatMap { $0.minutesByContext.values }.max() ?? 1, 1)
+            for (index, day) in days.enumerated() {
+                let x = (CGFloat(index) + 0.5) * step
+                var warp = Path()
+                warp.move(to: CGPoint(x: x, y: 8))
+                warp.addLine(to: CGPoint(x: x, y: size.height - 8))
+                drawing.stroke(warp, with: .linearGradient(
+                    Gradient(colors: [.clear, Color.filumaSubtle.opacity(0.25), .clear]),
+                    startPoint: CGPoint(x: x, y: 0), endPoint: CGPoint(x: x, y: size.height)
+                ), lineWidth: selectedDay == day ? 3 : 1)
+                if selectedDay == day {
+                    drawing.fill(Path(CGRect(x: x - step / 2, y: 0, width: step, height: size.height)),
+                                 with: .color(Color.brand300.opacity(0.09)))
+                }
             }
-            var y: CGFloat = size.height
-            while y > 0 {
-                context.stroke(
-                    Path { $0.move(to: CGPoint(x: 0, y: y)); $0.addLine(to: CGPoint(x: size.width, y: y)) },
-                    with: .color(color), lineWidth: 1
-                )
-                y -= 9
-            }
-        }
-    }
-
-    private func dayColumn(_ day: WeaveDay, maxTotal: Int) -> some View {
-        let isToday = Calendar.current.isDateInToday(day.date)
-
-        return VStack(spacing: 2) {
-            if day.totalMinutes == 0 {
-                // The bare warp: a rest day still holds the cloth together.
-                Circle()
-                    .fill(Color.filumaFaint.opacity(0.7))
-                    .frame(width: 5, height: 5)
-                    .padding(.bottom, 2)
-            } else {
-                ForEach(TaskContext.allCases) { context in
-                    if let minutes = day.minutesByContext[context], minutes > 0 {
-                        Capsule(style: .continuous)
-                            .fill(context.color)
-                            .frame(height: max(
-                                12,
-                                CGFloat(minutes) / CGFloat(maxTotal) * Self.columnHeight
-                            ))
-                            .opacity(selectedDay == nil || selectedDay == day ? 1 : 0.35)
-                    }
+            for (contextIndex, context) in TaskContext.allCases.enumerated() {
+                let active = days.enumerated().filter { ($0.element.minutesByContext[context] ?? 0) > 0 }
+                guard !active.isEmpty else { continue }
+                let points = active.map { index, day -> CGPoint in
+                    // Vertical travel is the weave, not a value axis. Knots
+                    // alone encode effort, while context strands cross in time.
+                    let phase = CGFloat(index) * 0.62 + CGFloat(contextIndex) * 2.094
+                    return CGPoint(x: (CGFloat(index) + 0.5) * step,
+                                   y: size.height * (0.5 + sin(phase) * 0.32))
+                }
+                var thread = Path()
+                thread.move(to: points[0])
+                for index in points.indices.dropFirst() {
+                    let previous = points[index - 1]
+                    let point = points[index]
+                    let middle = (previous.x + point.x) / 2
+                    thread.addCurve(to: point,
+                                    control1: CGPoint(x: middle, y: previous.y),
+                                    control2: CGPoint(x: middle, y: point.y))
+                }
+                drawing.stroke(thread, with: .color(context.color.opacity(0.65)),
+                               style: StrokeStyle(lineWidth: 8, lineCap: .round))
+                drawing.stroke(thread, with: .color(context.displayColor.opacity(0.7)),
+                               style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                for (index, entry) in active.enumerated() {
+                    let minutes = entry.element.minutesByContext[context] ?? 0
+                    let radius = 2.5 + sqrt(CGFloat(minutes) / CGFloat(maxMinutes)) * 3
+                    let point = points[index]
+                    let knot = Path(ellipseIn: CGRect(x: point.x - radius, y: point.y - radius,
+                                                     width: radius * 2, height: radius * 2))
+                    let opacity = selectedDay == nil || selectedDay == entry.element ? 1.0 : 0.4
+                    drawing.fill(knot, with: .color(context.color.opacity(opacity)))
+                    drawing.stroke(knot, with: .color(context.displayColor.opacity(opacity)), lineWidth: 1)
                 }
             }
         }
-        .frame(height: Self.columnHeight + 10, alignment: .bottom)
-        .background {
-            if isToday {
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(Color.brand500.opacity(0.10))
-                    .padding(.horizontal, -3)
-                    .padding(.vertical, -6)
-                    .accessibilityHidden(true)
-            }
-        }
-        .overlay {
-            if selectedDay == day {
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .stroke(Color.brand300.opacity(0.85), lineWidth: 1)
-                    .padding(.horizontal, -2)
-                    .padding(.vertical, -3)
-                    .accessibilityHidden(true)
-            }
-        }
+        .accessibilityHidden(true)
+    }
+
+    private func grid(color: Color) -> some View {
+        LinearGradient(colors: [Color.brand500.opacity(0.06), .clear], startPoint: .topLeading, endPoint: .bottomTrailing)
     }
 
     private func weekdayLetter(_ date: Date) -> String {
@@ -364,7 +378,10 @@ struct WeaveView: View {
         let all = days
         let totalMinutes = all.reduce(0) { $0 + $1.totalMinutes }
         let totalStarts = all.reduce(0) { $0 + $1.sessionCount }
-        let streak = StreakCalculator.startStreak(startDates: sessions.map(\.startedAt))
+        let streak = tasks.filter { task in
+            guard task.isComplete, let completed = task.completedAt, let first = all.first else { return false }
+            return completed >= first.date && completed <= Date.now
+        }.count
 
         return Group {
             if dynamicTypeSize.isAccessibilitySize {
@@ -385,7 +402,7 @@ struct WeaveView: View {
     private func weaveMetrics(totalMinutes: Int, totalStarts: Int, streak: Int) -> some View {
         WeaveMetric(
             value: CountdownFormatter.effortString(minutes: totalMinutes),
-            label: "woven",
+            label: "focused",
             tint: .filumaText
         )
         WeaveMetric(
@@ -395,7 +412,7 @@ struct WeaveView: View {
         )
         WeaveMetric(
             value: "\(streak)",
-            label: "day streak",
+            label: "tasks finished",
             tint: .personalDisplay
         )
     }

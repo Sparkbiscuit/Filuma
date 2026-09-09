@@ -8,7 +8,7 @@ import SwiftData
 enum DataExporter {
 
     struct Export: Codable {
-        var version = 4
+        var version = 5
         var exportedAt = Date()
         var settings: SettingsRecord?
         var tasks: [TaskRecord] = []
@@ -60,6 +60,8 @@ enum DataExporter {
         let isComplete: Bool
         let completedAt: Date?
         let manualProgressPercent: Int
+        let earliestStart: Date?
+        let safeZoneMinutes: Int?
         let firstStep: String?
         let source: String
         let templateId: UUID?
@@ -70,6 +72,7 @@ enum DataExporter {
         let title: String
         let context: String
         let effortMinutes: Int
+        let safeZoneMinutes: Int?
         let firstStep: String?
         let nextDeadline: Date
         let repeatUntil: Date
@@ -152,6 +155,8 @@ enum DataExporter {
                 isComplete: task.isComplete,
                 completedAt: task.completedAt,
                 manualProgressPercent: task.manualProgressPercent,
+                earliestStart: task.earliestStart,
+                safeZoneMinutes: task.safeZoneMinutes,
                 firstStep: task.firstStep,
                 source: task.source.rawValue,
                 templateId: task.templateId
@@ -163,6 +168,7 @@ enum DataExporter {
                 title: template.title,
                 context: template.context.rawValue,
                 effortMinutes: template.effortMinutes,
+                safeZoneMinutes: template.safeZoneMinutes,
                 firstStep: template.firstStep,
                 nextDeadline: template.nextDeadline,
                 repeatUntil: template.repeatUntil

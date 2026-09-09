@@ -453,16 +453,20 @@ struct SettingsView: View {
                 range: 60...180, step: 30,
                 display: CountdownFormatter.effortString(minutes: settings.maxBlockMinutes)
             )
-            stepperRow(
-                icon: "shield.fill", tint: .personalDisplay, label: "Deadline buffer",
-                value: planningPreferenceBinding(
-                    settings: settings,
+            SafeZonePicker(
+                minutes: Binding<Int?>(
                     get: { settings.deadlineBufferMinutes },
-                    set: { settings.deadlineBufferMinutes = $0 }
-                ),
-                range: 0...480, step: 30,
-                display: CountdownFormatter.effortString(minutes: settings.deadlineBufferMinutes)
+                    set: { value in
+                        planningPreferenceBinding(
+                            settings: settings,
+                            get: { settings.deadlineBufferMinutes },
+                            set: { settings.deadlineBufferMinutes = $0 }
+                        ).wrappedValue = value ?? 1440
+                    }
+                )
             )
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
             stepperRow(
                 icon: "hourglass.bottomhalf.filled", tint: .personalDisplay, label: "Start buffer",
                 value: planningPreferenceBinding(
@@ -1700,5 +1704,90 @@ private struct CalendarPickerView: View {
                 }
             }
         )
+    }
+}
+
+/// The same duration choices are used for the global preference and task drafts.
+/// `nil` follows the global preference; zero explicitly requests no Safe Zone.
+struct SafeZonePicker: View {
+    @Binding var minutes: Int?
+    var globalDefault: Int? = nil
+    @State private var showCustom = false
+
+    private let presets = [0, 360, 720, 1440, 2880, 4320]
+
+    static func label(for minutes: Int) -> String {
+        if minutes == 0 { return "None" }
+        if minutes % 1440 == 0 {
+            let days = minutes / 1440
+            return "\(days) \(days == 1 ? "day" : "days")"
+        }
+        return CountdownFormatter.effortString(minutes: minutes)
+    }
+
+    private var selectionLabel: String {
+        if let minutes { return Self.label(for: minutes) }
+        return "Default · \(Self.label(for: globalDefault ?? 1440))"
+    }
+
+    private var customBinding: Binding<Int> {
+        Binding(
+            get: { minutes ?? globalDefault ?? 1440 },
+            set: { minutes = max(0, min(43_200, $0)) }
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Label("Safe Zone", systemImage: "shield.lefthalf.filled")
+                    .font(AppFont.bodySemibold(14))
+                    .foregroundStyle(Color.filumaText)
+                Spacer(minLength: 8)
+                Menu {
+                    if let globalDefault {
+                        Button("Use default (\(Self.label(for: globalDefault)))") {
+                            minutes = nil
+                            showCustom = false
+                        }
+                    }
+                    ForEach(presets, id: \.self) { preset in
+                        Button(Self.label(for: preset)) {
+                            minutes = preset
+                            showCustom = false
+                        }
+                    }
+                    Button("Custom…") {
+                        minutes = minutes ?? globalDefault ?? 1440
+                        showCustom = true
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(selectionLabel)
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.caption2)
+                    }
+                    .font(AppFont.body(14))
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
+                    .foregroundStyle(Color.brand300)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityLabel("Safe Zone")
+                .accessibilityValue(selectionLabel)
+            }
+            if showCustom || (minutes.map { !presets.contains($0) } ?? false) {
+                Stepper(value: customBinding, in: 0...43_200, step: 15) {
+                    Text("\(customBinding.wrappedValue) minutes")
+                        .font(AppFont.body(14))
+                        .foregroundStyle(Color.filumaText)
+                }
+                .accessibilityLabel("Custom Safe Zone in minutes")
+            }
+            Text("Aim to finish this early. Filuma can use this time if needed to meet the deadline.")
+                .font(AppFont.caption(12))
+                .foregroundStyle(Color.filumaSubtle)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 }

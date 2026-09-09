@@ -33,6 +33,7 @@ final class FilumaTests: XCTestCase {
 
     private func makeSettings() -> UserSettings {
         let settings = UserSettings()
+        settings.deadlineBufferMinutes = 120
         context.insert(settings)
         return settings
     }
@@ -67,7 +68,7 @@ final class FilumaTests: XCTestCase {
         XCTAssertEqual(settings.sleepMinute, 0, file: file, line: line)
         XCTAssertEqual(settings.minBlockMinutes, 30, file: file, line: line)
         XCTAssertEqual(settings.maxBlockMinutes, 90, file: file, line: line)
-        XCTAssertEqual(settings.deadlineBufferMinutes, 120, file: file, line: line)
+        XCTAssertEqual(settings.deadlineBufferMinutes, 1440, file: file, line: line)
         XCTAssertEqual(settings.startBufferMinutes, 15, file: file, line: line)
         XCTAssertFalse(settings.planningRebuildPending, file: file, line: line)
     }
@@ -120,7 +121,7 @@ final class FilumaTests: XCTestCase {
         XCTAssertEqual(defaults.sleepMinute, 0)
         XCTAssertEqual(defaults.minBlockMinutes, 30)
         XCTAssertEqual(defaults.maxBlockMinutes, 90)
-        XCTAssertEqual(defaults.deadlineBufferMinutes, 120)
+        XCTAssertEqual(defaults.deadlineBufferMinutes, 1440)
         XCTAssertEqual(defaults.startBufferMinutes, 15)
         assertFreshSchedulingDefaults(UserSettings())
     }
@@ -581,6 +582,90 @@ final class FilumaTests: XCTestCase {
         XCTAssertEqual(SchedulerService.splitEffort(minutes: 20, minBlock: 30, maxBlock: 90), [20])
     }
 
+    func testDistributedSchedulingUsesSeparatedDaysAndPreferredFinish() {
+        let settings = makeSettings()
+        settings.maxBlockMinutes = 60
+        settings.deadlineBufferMinutes = 1440
+        let task = makeTask(effort: 240, deadlineHoursFromAnchor: 9 * 24)
+        let blocks = scheduledBlocks(from: SchedulerService.schedule(
+            task: task, allBlocks: [], settings: settings, from: anchor
+        )).sorted { $0.startTime < $1.startTime }
+        XCTAssertEqual(blocks.map(\.durationMinutes), [60, 60, 60, 60])
+        let days = blocks.map { calendar.startOfDay(for: $0.startTime) }
+        XCTAssertEqual(Set(days).count, 4)
+        for pair in zip(days, days.dropFirst()) {
+            XCTAssertGreaterThanOrEqual(calendar.dateComponents([.day], from: pair.0, to: pair.1).day!, 2)
+        }
+        XCTAssertLessThanOrEqual(blocks.last!.endTime, task.deadline.addingTimeInterval(-86400))
+    }
+
+    func testSafeZoneFallsBackThroughActualDeadlineBeforeReportingShortfall() {
+        let settings = makeSettings()
+        settings.deadlineBufferMinutes = 120
+        let task = makeTask(effort: 120, deadlineHoursFromAnchor: 3)
+        let result = SchedulerService.schedule(task: task, allBlocks: [], settings: settings, from: anchor)
+        guard case .success(let blocks) = result else { return XCTFail("Work fits through the actual deadline") }
+        XCTAssertEqual(blocks.reduce(0) { $0 + $1.durationMinutes }, 120)
+        XCTAssertTrue(blocks.contains { $0.endTime > task.deadline.addingTimeInterval(-7200) })
+        XCTAssertTrue(blocks.allSatisfy { $0.endTime <= task.deadline })
+    }
+
+    func testElapsedSafeZoneAndPerTaskNoneRemainSchedulable() {
+        let settings = makeSettings()
+        settings.deadlineBufferMinutes = 3 * 1440
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 2)
+        var result = SchedulerService.schedule(task: task, allBlocks: [], settings: settings, from: anchor)
+        XCTAssertEqual(scheduledBlocks(from: result).reduce(0) { $0 + $1.durationMinutes }, 60)
+        // Detach uncommitted preview blocks before trying the override.
+        for block in scheduledBlocks(from: result) { block.task = nil }
+        task.safeZoneMinutes = 0
+        result = SchedulerService.schedule(task: task, allBlocks: [], settings: settings, from: anchor)
+        XCTAssertEqual(scheduledBlocks(from: result).reduce(0) { $0 + $1.durationMinutes }, 60)
+        XCTAssertNotEqual(SchedulerService.pressure(for: task, allBlocks: [], settings: settings, now: anchor), .infinity)
+    }
+
+    func testDistributionDoesNotConsumeAnotherTasksOnlyLongGap() throws {
+        let settings = makeSettings()
+        settings.deadlineBufferMinutes = 0
+        settings.startBufferMinutes = 0
+        settings.minBlockMinutes = 60
+        settings.maxBlockMinutes = 90
+        settings.wakeHour = 9
+        settings.sleepHour = 12
+        let short = makeTask(effort: 60, deadlineHoursFromAnchor: 26)
+        let long = makeTask(effort: 90, deadlineHoursFromAnchor: 27)
+        let busy = BusyEvent(source: .appleCalendar, sourceId: "scarce-gap", title: "Busy",
+            startTime: anchor.addingTimeInterval(3600), endTime: anchor.addingTimeInterval(24 * 3600))
+        context.insert(busy)
+        let summary = SchedulerService.rebalance(tasks: [short, long], allBlocks: [], blockedTimes: [],
+            busyEvents: [busy], settings: settings, now: anchor, context: context)
+        XCTAssertEqual(summary.unschedulableTasks, 0)
+        let all = try context.fetch(FetchDescriptor<ScheduledBlock>())
+        XCTAssertEqual(all.filter { $0.task?.id == short.id }.reduce(0) { $0 + $1.durationMinutes }, 60)
+        XCTAssertEqual(all.filter { $0.task?.id == long.id }.reduce(0) { $0 + $1.durationMinutes }, 90)
+        let chronological = all.sorted { $0.startTime < $1.startTime }
+        for pair in zip(chronological, chronological.dropFirst()) {
+            XCTAssertLessThanOrEqual(pair.0.endTime, pair.1.startTime)
+        }
+    }
+
+    func testUnchangedRefreshPreservesDistributedBlockIdentitiesAndDates() throws {
+        let settings = makeSettings()
+        settings.maxBlockMinutes = 60
+        settings.deadlineBufferMinutes = 1440
+        settings.startBufferMinutes = 0
+        let task = makeTask(effort: 240, deadlineHoursFromAnchor: 9 * 24)
+        SchedulerService.rebalance(tasks: [task], allBlocks: [], blockedTimes: [], settings: settings,
+            now: anchor, context: context)
+        let before = try context.fetch(FetchDescriptor<ScheduledBlock>())
+        let dates = Dictionary(uniqueKeysWithValues: before.map { ($0.id, $0.startTime) })
+        let summary = SchedulerService.catchUpMissedBlocks(tasks: [task], allBlocks: before, blockedTimes: [],
+            settings: settings, now: anchor.addingTimeInterval(300), context: context)
+        XCTAssertEqual(summary.adjustedTasks, 0)
+        let after = try context.fetch(FetchDescriptor<ScheduledBlock>())
+        XCTAssertEqual(Dictionary(uniqueKeysWithValues: after.map { ($0.id, $0.startTime) }), dates)
+    }
+
     // MARK: - schedule()
 
     func testScheduleSuccessRespectsWindowAndBuffer() {
@@ -677,8 +762,8 @@ final class FilumaTests: XCTestCase {
 
     func testTightWindowReturnsPartialFit() {
         let settings = makeSettings() // buffer 120
-        // Deadline 3.5h out → usable window is 9:00–10:30 (90 minutes).
-        let task = makeTask(effort: 120, deadlineHoursFromAnchor: 3.5)
+        // The actual deadline leaves 90 minutes, including the Safe Zone.
+        let task = makeTask(effort: 120, deadlineHoursFromAnchor: 1.5)
         let result = SchedulerService.schedule(
             task: task, allBlocks: [], settings: settings, from: anchor
         )
@@ -772,14 +857,10 @@ final class FilumaTests: XCTestCase {
             return XCTFail("expected all three gaps to fit, got \(result)")
         }
         XCTAssertEqual(blocks.map(\.durationMinutes), [40, 30, 30])
-        XCTAssertEqual(
-            blocks.map(\.startTime),
-            [
-                anchor,
-                anchor.addingTimeInterval(60 * 60),
-                anchor.addingTimeInterval(120 * 60)
-            ]
-        )
+        for (block, minute) in zip(blocks, [0, 60, 120]) {
+            XCTAssertGreaterThanOrEqual(block.startTime, anchor.addingTimeInterval(Double(minute * 60)))
+            XCTAssertLessThanOrEqual(block.endTime, anchor.addingTimeInterval(Double((minute + 45) * 60)))
+        }
     }
 
     func testScheduleAllowsShortRemainderInShortSlot() {
@@ -1975,7 +2056,8 @@ final class FilumaTests: XCTestCase {
         XCTAssertEqual(summary.replannedTasks, 1)
         XCTAssertEqual(summary.unschedulableTasks, 1, "impossible fits must be surfaced, not silent")
         let all = try context.fetch(FetchDescriptor<ScheduledBlock>())
-        XCTAssertTrue(all.isEmpty, "the dangling missed block must be removed either way")
+        XCTAssertFalse(all.contains { $0.id == missed.id }, "the dangling missed block must be removed")
+        XCTAssertEqual(all.reduce(0) { $0 + $1.durationMinutes }, 45, "Use the remaining deadline window before reporting a shortfall")
     }
 
     // MARK: - Rebalance (earliest deadline first)
@@ -1989,7 +2071,7 @@ final class FilumaTests: XCTestCase {
         let occupying = ScheduledBlock(task: relaxed, startTime: anchor, durationMinutes: 120)
         context.insert(occupying)
 
-        let urgent = makeTask(effort: 30, deadlineHoursFromAnchor: 3)
+        let urgent = makeTask(effort: 30, deadlineHoursFromAnchor: 1)
         try context.save()
 
         // Gap-fill alone fails: the near window is taken.
@@ -2015,7 +2097,7 @@ final class FilumaTests: XCTestCase {
         XCTAssertEqual(summary.unschedulableTasks, 0, "both tasks should fit after rebalancing")
 
         let all = try context.fetch(FetchDescriptor<ScheduledBlock>())
-        let urgentWindowEnd = urgent.deadline.addingTimeInterval(-Double(settings.deadlineBufferMinutes) * 60)
+        let urgentWindowEnd = urgent.deadline
         let urgentBlocks = all.filter { $0.task?.id == urgent.id }
         let relaxedBlocks = all.filter { $0.task?.id == relaxed.id }
 
@@ -2496,9 +2578,7 @@ final class FilumaTests: XCTestCase {
         let task = FilumaTask(
             title: "Mixed midnight gaps",
             context: .school,
-            deadline: windowEnd.addingTimeInterval(
-                TimeInterval(settings.deadlineBufferMinutes * 60)
-            ),
+            deadline: windowEnd,
             effortMinutes: 100
         )
         context.insert(task)
@@ -2544,12 +2624,12 @@ final class FilumaTests: XCTestCase {
 
     func testPressureReflectsRemainingVersusFreeTime() throws {
         let settings = makeSettings() // buffer 120
-        // 60m of work; window 9:00 → deadline(anchor+7h)−2h buffer = 14:00 → 300 free.
+        // Pressure measures achievable capacity through the actual deadline: 420 minutes.
         let task = makeTask(effort: 60, deadlineHoursFromAnchor: 7)
         let pressure = try XCTUnwrap(SchedulerService.pressure(
             for: task, allBlocks: [], settings: settings, now: anchor
         ))
-        XCTAssertEqual(pressure, 0.2, accuracy: 0.01)
+        XCTAssertEqual(pressure, 60.0 / 420.0, accuracy: 0.01)
     }
 
     func testPressureRespectsDailyFocusRemainingAfterExistingWork() throws {
@@ -2606,8 +2686,8 @@ final class FilumaTests: XCTestCase {
 
     func testPressureInfiniteWhenNoWindowRemains() throws {
         let settings = makeSettings() // buffer 120
-        // Deadline in 1h, buffer 2h: the usable window is already gone.
-        let task = makeTask(effort: 60, deadlineHoursFromAnchor: 1)
+        // The actual deadline has passed.
+        let task = makeTask(effort: 60, deadlineHoursFromAnchor: -1)
         let pressure = try XCTUnwrap(SchedulerService.pressure(
             for: task, allBlocks: [], settings: settings, now: anchor
         ))
@@ -3333,13 +3413,11 @@ final class FilumaTests: XCTestCase {
         )
     }
 
-    func testRescheduleDoesNotCountLockedBlockAfterBufferedDeadline() throws {
+    func testRescheduleDoesNotCountLockedBlockAfterActualDeadline() throws {
         let settings = makeSettings()
         settings.startBufferMinutes = 0
         let task = makeTask(effort: 60, deadlineHoursFromAnchor: 4)
-        let windowEnd = task.deadline.addingTimeInterval(
-            -Double(settings.deadlineBufferMinutes) * 60
-        )
+        let windowEnd = task.deadline
         let locked = ScheduledBlock(
             task: task,
             startTime: windowEnd.addingTimeInterval(60 * 60),
@@ -3416,13 +3494,11 @@ final class FilumaTests: XCTestCase {
         XCTAssertEqual(replacements.reduce(0) { $0 + $1.durationMinutes }, 90)
     }
 
-    func testRebalanceDoesNotCountLockedBlockAfterBufferedDeadline() throws {
+    func testRebalanceDoesNotCountLockedBlockAfterActualDeadline() throws {
         let settings = makeSettings()
         settings.startBufferMinutes = 0
         let task = makeTask(effort: 60, deadlineHoursFromAnchor: 4)
-        let windowEnd = task.deadline.addingTimeInterval(
-            -Double(settings.deadlineBufferMinutes) * 60
-        )
+        let windowEnd = task.deadline
         let locked = ScheduledBlock(
             task: task,
             startTime: windowEnd.addingTimeInterval(60 * 60),
@@ -5491,7 +5567,7 @@ final class FilumaTests: XCTestCase {
         XCTAssertEqual(receipt.scheduledMinutes, 60)
         XCTAssertEqual(receipt.unscheduledMinutes, 0)
         XCTAssertEqual(receipt.scheduledBlockCount, 1)
-        XCTAssertEqual(receipt.firstBlockStart, anchor)
+        XCTAssertEqual(receipt.firstBlockStart, prepared.task.scheduledBlocks.map(\.startTime).min())
         XCTAssertNotNil(receipt.templateID)
         XCTAssertEqual(prepared.task.firstStep, "Open the protocol")
 
@@ -6367,7 +6443,7 @@ final class FilumaTests: XCTestCase {
         decoder.dateDecodingStrategy = .iso8601
         let export = try decoder.decode(DataExporter.Export.self, from: data)
 
-        XCTAssertEqual(export.version, 4)
+        XCTAssertEqual(export.version, 5)
         XCTAssertEqual(export.tasks.count, 1)
         XCTAssertEqual(export.blocks.count, 1)
         XCTAssertEqual(export.workSessions.count, 1)

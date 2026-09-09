@@ -41,6 +41,9 @@ final class FilumaTask {
     /// Self-reported completion (0–100) from work sessions; combined with
     /// block-based progress, whichever is further along.
     var manualProgressPercent: Int = 0
+    /// Preferred time before the deadline. Nil follows settings; zero means None.
+    var earliestStart: Date? = nil
+    var safeZoneMinutes: Int? = nil
     /// The tiny concrete opening move ("open the doc, paste the data table").
     /// "Write lab report" is un-startable; the first physical action isn't.
     /// Cleared automatically after the first work session — its job is done.
@@ -64,7 +67,8 @@ final class FilumaTask {
         deadline: Date,
         effortMinutes: Int,
         source: TaskSource = .manual,
-        firstStep: String? = nil
+        firstStep: String? = nil,
+        safeZoneMinutes: Int? = nil
     ) {
         self.id = UUID()
         self.title = title
@@ -75,6 +79,7 @@ final class FilumaTask {
         self.userModified = false
         self.source = source
         self.manualProgressPercent = 0
+        self.safeZoneMinutes = safeZoneMinutes.map { max(0, $0) }
         self.firstStep = firstStep
         self.scheduledBlocks = []
         self.workSessions = []
@@ -275,6 +280,7 @@ final class TaskTemplate {
     var context: TaskContext
     var effortMinutes: Int
     var firstStep: String?
+    var safeZoneMinutes: Int? = nil
     /// Deadline of the next occurrence to materialize; advances by 7 days
     /// per stamped task.
     var nextDeadline: Date
@@ -286,6 +292,7 @@ final class TaskTemplate {
         context: TaskContext,
         effortMinutes: Int,
         firstStep: String? = nil,
+        safeZoneMinutes: Int? = nil,
         nextDeadline: Date,
         repeatUntil: Date
     ) {
@@ -293,6 +300,7 @@ final class TaskTemplate {
         self.title = title
         self.context = context
         self.effortMinutes = effortMinutes
+        self.safeZoneMinutes = safeZoneMinutes.map { max(0, $0) }
         self.firstStep = firstStep
         self.nextDeadline = nextDeadline
         self.repeatUntil = repeatUntil
@@ -441,7 +449,7 @@ struct UserSettingsSchedulingDefaults: Equatable, Sendable {
         sleepMinute: 0,
         minBlockMinutes: 30,
         maxBlockMinutes: 90,
-        deadlineBufferMinutes: 120,
+        deadlineBufferMinutes: 1440,
         startBufferMinutes: 15
     )
 }

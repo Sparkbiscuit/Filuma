@@ -150,7 +150,7 @@ struct OnboardingView: View {
         VStack(alignment: .leading, spacing: 12) {
             summaryRow(icon: "sunrise.fill", text: "8 AM–11 PM planning window")
             summaryRow(icon: "rectangle.split.3x1", text: "30–90 minute work blocks")
-            summaryRow(icon: "flag.checkered", text: "2-hour deadline buffer")
+            summaryRow(icon: "flag.checkered", text: "1-day Safe Zone")
         }
         .font(AppFont.bodySemibold(13))
         .foregroundStyle(Color.filumaText)
@@ -163,7 +163,7 @@ struct OnboardingView: View {
                 .stroke(Color.filumaBorder, lineWidth: 1)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Recommended defaults: 8 AM to 11 PM, 30 to 90 minute blocks, 2-hour deadline buffer")
+        .accessibilityLabel("Recommended defaults: 8 AM to 11 PM, 30 to 90 minute blocks, 1-day Safe Zone")
     }
 
     private func summaryRow(icon: String, text: String) -> some View {
@@ -254,12 +254,12 @@ struct OnboardingView: View {
                 )
                 Divider().overlay(Color.filumaBorder).padding(.leading, 16)
                 stepperRow(
-                    label: "Deadline buffer",
+                    label: "Safe Zone",
                     identifier: "onboarding.deadlineBuffer",
                     value: { settings.deadlineBufferMinutes },
                     set: { settings.deadlineBufferMinutes = $0 },
-                    range: 0...480,
-                    step: 30
+                    range: 0...43200,
+                    step: 360
                 )
             }
             .background(Color.filumaSurface)

@@ -25,7 +25,7 @@ daily focus limit if you set one.
   "Your last 5 School tasks ran about 1.6× over. Plan for 2h 30m instead?" with a
   one-tap accept. Needs at least 3 tracked completions; suggestions cap at 2×.
 - **Pace dots** — every task carries a quiet pressure reading: remaining effort
-  versus the free time left before its buffered deadline. Green under 50%, amber
+  versus the free time left before its deadline. Green under 50%, amber
   to 80%, red beyond — plus one honest sentence in the stats bar about the most
   pressured task, days before anything turns into a crisis.
 - **Morning preview & evening wrap-up** — a notification 30 minutes after wake
@@ -67,7 +67,8 @@ daily focus limit if you set one.
   credentials, sync cursors, and imported calendar-event copies stay out of
   the portable file. Your authored data is yours.
 - **Auto-scheduling** — work is chunked into blocks (configurable min/max size) and
-  packed into the gaps that really exist before your buffered deadline. Fragmented
+  spread across the available days before a preferred Safe Zone, with the actual
+  deadline available when needed. Fragmented
   calendars and daily focus limits are reflected in both placement and pace.
 - **Catch-up replanning** — blocks you miss are automatically replanned, and the
   whole schedule rebalances earliest-deadline-first, so an urgent task claims
@@ -90,6 +91,12 @@ daily focus limit if you set one.
   calendars you choose as busy time the scheduler works around.
 - **Widgets** — an Up Next widget for the Home Screen and Lock Screen, plus a
   Live Activity while a work session timer is running.
+
+- **Safe Zone** — a preferred early finish, globally configurable with optional
+  task overrides. New users start with one day; existing saved buffers stay intact.
+  A task preview shows its actual spread, sessions, and whether the buffer is used.
+- **Room to breathe** — a landscape-backed Today, native Dynamic Type, an ember
+  focus ring, and context threads woven from recorded effort in both appearances.
 
 ## Project
 

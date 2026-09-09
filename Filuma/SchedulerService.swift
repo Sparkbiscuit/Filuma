@@ -153,11 +153,10 @@ struct SchedulerService {
         let remaining = max(0, requestedMinutes)
         guard remaining > 0 else { return .success(blocks: []) }
 
-        let bufferSeconds = TimeInterval(settings.deadlineBufferMinutes * 60)
-        let windowEnd = task.deadline.addingTimeInterval(-bufferSeconds)
+        let windowEnd = task.deadline
 
         // Blocks start on tidy 5-minute boundaries, never at "9:47:33".
-        let startDate = roundUpToFiveMinutes(startDate)
+        let startDate = roundUpToFiveMinutes(max(startDate, task.earliestStart ?? startDate))
 
         guard startDate < windowEnd else { return .noSlots }
 
@@ -200,7 +199,8 @@ struct SchedulerService {
             requestedMinutes: remaining,
             in: freeSlots,
             settings: settings,
-            minutesPerDay: &minutesPerDay
+            minutesPerDay: &minutesPerDay,
+            fixedBlocks: allBlocks.filter { $0.task?.id == task.id && !$0.isComplete }
         )
     }
 
@@ -217,8 +217,24 @@ struct SchedulerService {
         settings: UserSettings,
         from startDate: Date? = nil,
         now: Date = Date(),
-        context: ModelContext
+        context: ModelContext,
+        endingSessionID: UUID? = nil
     ) -> ScheduleResult {
+        // A running or paused timer owns its reservations until durable stop.
+        // Settings/editor changes are picked up by the next safe refresh.
+        if let session = WorkSessionControlStore.load(), session.taskID == task.id,
+           session.sessionID != endingSessionID {
+            settings.planningRebuildPending = true
+            let retained = allBlocks.filter { $0.task?.id == task.id && !$0.isComplete && $0.endTime > now }
+            let windowStart = max(now, task.earliestStart ?? now)
+            let covered = retained.reduce(0) { total, block in
+                total + max(0, Int(min(block.endTime, task.deadline)
+                    .timeIntervalSince(max(block.startTime, windowStart)) / 60))
+            }
+            return covered >= task.remainingMinutes
+                ? .success(blocks: retained)
+                : .partialFit(scheduled: retained, unscheduledMinutes: task.remainingMinutes - covered)
+        }
         // Remove unlocked, incomplete blocks for this task
         let blocksToRemove = task.scheduledBlocks.filter { !$0.isLocked && !$0.isComplete }
         let removedIds = Set(blocksToRemove.map(\.id))
@@ -233,9 +249,7 @@ struct SchedulerService {
             startDate
                 ?? now.addingTimeInterval(TimeInterval(settings.startBufferMinutes * 60))
         )
-        let windowEnd = task.deadline.addingTimeInterval(
-            -Double(settings.deadlineBufferMinutes) * 60
-        )
+        let windowEnd = task.deadline
         let retainedLockedMinutes = retainedLockedCoverageMinutes(
             for: task,
             in: remainingBlocks,
@@ -284,9 +298,11 @@ struct SchedulerService {
         context: ModelContext
     ) -> CatchUpSummary {
         var summary = CatchUpSummary()
+        let sessionTaskID = WorkSessionControlStore.load()?.taskID
+        if tasks.contains(where: { $0.id == sessionTaskID }) { settings.planningRebuildPending = true }
         let active = tasks
-            .filter { !$0.isComplete && $0.deadline > now }
-            .sorted { $0.deadline < $1.deadline }
+            .filter { !$0.isComplete && $0.deadline > now && $0.id != sessionTaskID }
+            .sorted { $0.deadline == $1.deadline ? $0.id.uuidString < $1.id.uuidString : $0.deadline < $1.deadline }
         guard !active.isEmpty else {
             settings.lastFutileAutomaticRebalanceFingerprint = nil
             return summary
@@ -308,7 +324,7 @@ struct SchedulerService {
             now.addingTimeInterval(TimeInterval(settings.startBufferMinutes * 60))
         )
         let latestWindowEnd = active
-            .map { $0.deadline.addingTimeInterval(-Double(settings.deadlineBufferMinutes) * 60) }
+            .map { $0.deadline }
             .max() ?? start
 
         // Build the shared free-time timeline once. Each task sees the same
@@ -347,9 +363,7 @@ struct SchedulerService {
             : [:]
 
         for task in active {
-            let windowEnd = task.deadline.addingTimeInterval(
-                -Double(settings.deadlineBufferMinutes) * 60
-            )
+            let windowEnd = task.deadline
             let retainedLockedMinutes = retainedLockedCoverageMinutes(
                 for: task,
                 in: kept,
@@ -363,7 +377,7 @@ struct SchedulerService {
             )
             let taskSlots = freeSlots.compactMap { slot -> Interval? in
                 let clipped = Interval(
-                    start: max(slot.start, start),
+                    start: max(slot.start, max(start, task.earliestStart ?? start)),
                     end: min(slot.end, windowEnd)
                 )
                 return clipped.durationMinutes >= Double(taskMinimum)
@@ -379,7 +393,8 @@ struct SchedulerService {
                     requestedMinutes: requestedMinutes,
                     in: taskSlots,
                     settings: settings,
-                    minutesPerDay: &minutesPerDay
+                    minutesPerDay: &minutesPerDay,
+                    distribute: false
                 )
             } else {
                 result = .noSlots
@@ -399,6 +414,34 @@ struct SchedulerService {
                     summary.unschedulableTasks += 1
                 }
             }
+        }
+        // First secure achievable coverage for every deadline. Moving a block
+        // below never consumes another task's reservation, so spacing cannot
+        // strand work that the capacity pass managed to fit.
+        for task in active {
+            let movable = kept.filter {
+                $0.task?.id == task.id && !$0.isComplete && !$0.isLocked
+            }.sorted { $0.startTime < $1.startTime }
+            guard !movable.isEmpty else { continue }
+            let movableIDs = Set(movable.map(\.id))
+            let otherBlocks = kept.filter { !movableIDs.contains($0.id) }
+            var taskOccupied = otherBlocks.filter { !$0.isComplete }.map {
+                Interval(start: $0.startTime, end: $0.endTime)
+            }
+            for blocked in blockedTimes {
+                taskOccupied.append(contentsOf: blocked.occurrences(from: start, to: task.deadline)
+                    .map { Interval(start: $0.start, end: $0.end) })
+            }
+            taskOccupied.append(contentsOf: busyEvents.map {
+                Interval(start: $0.startTime, end: $0.endTime)
+            })
+            let opportunities = findFreeSlots(
+                from: max(start, task.earliestStart ?? start), to: task.deadline, occupied: taskOccupied,
+                settings: settings, allowOvernight: false, minimumSlotMinutes: 1
+            )
+            spread(blocks: movable, in: opportunities, task: task, settings: settings,
+                   initialFocus: focusMinutesPerDay(in: otherBlocks),
+                   fixedBlocks: otherBlocks.filter { $0.task?.id == task.id && !$0.isComplete })
         }
         updateFutileAutomaticRebalanceMarker(
             tasks: tasks,
@@ -527,6 +570,8 @@ struct SchedulerService {
                 [
                     "task", $0.id.uuidString, fingerprintDate($0.deadline),
                     String($0.effortMinutes), String($0.manualProgressPercent),
+                    $0.safeZoneMinutes.map(String.init) ?? "global",
+                    $0.earliestStart.map(fingerprintDate) ?? "any-start",
                     fingerprintBool($0.isComplete)
                 ].joined(separator: "|")
             })
@@ -763,7 +808,7 @@ struct SchedulerService {
     }
 
     /// Schedule pressure for a task: remaining effort ÷ free minutes left
-    /// before its buffered deadline. 0.5 means half the free time is spoken
+    /// before its actual deadline. 0.5 means half the free time is spoken
     /// for; above 1 the task no longer fits. Infinity when there's no window
     /// at all. Nil when the task carries no remaining effort.
     static func pressure(
@@ -797,13 +842,11 @@ struct SchedulerService {
         let remaining = task.remainingMinutes
         guard !task.isComplete, remaining > 0 else { return nil }
 
-        let windowEnd = task.deadline.addingTimeInterval(
-            -Double(settings.deadlineBufferMinutes) * 60
-        )
+        let windowEnd = task.deadline
         guard windowEnd > now else { return (.infinity, 0) }
 
         let available = scheduleableMinutes(
-            from: now,
+            from: max(now, task.earliestStart ?? now),
             to: windowEnd,
             excludingTaskId: task.id,
             allBlocks: allBlocks,
@@ -854,7 +897,8 @@ struct SchedulerService {
                         deadline: next,
                         effortMinutes: template.effortMinutes,
                         source: .recurring,
-                        firstStep: template.firstStep
+                        firstStep: template.firstStep,
+                        safeZoneMinutes: template.safeZoneMinutes
                     )
                     task.templateId = template.id
                     context.insert(task)
@@ -919,7 +963,7 @@ struct SchedulerService {
 
     /// Locked blocks stay where the user put them, but only the portion that
     /// can still satisfy this scheduling pass counts as retained coverage.
-    /// Elapsed time and time after the buffered deadline cannot reduce the
+    /// Elapsed time and time after the actual deadline cannot reduce the
     /// amount that must be placed inside the usable window. A still-future lock
     /// counts even when an explicit custom start pushes replacement work later.
     private static func retainedLockedCoverageMinutes(
@@ -969,9 +1013,149 @@ struct SchedulerService {
         }
     }
 
+    /// Capacity remains the first objective. Prefer the Safe Zone boundary,
+    /// then reclaim the full deadline window before reporting a shortfall.
+    private static func place(
+        task: FilumaTask,
+        requestedMinutes: Int,
+        in freeSlots: [Interval],
+        settings: UserSettings,
+        minutesPerDay: inout [Date: Double],
+        distribute: Bool = true,
+        fixedBlocks: [ScheduledBlock] = []
+    ) -> ScheduleResult {
+        let initialFocus = minutesPerDay
+        let target = task.deadline.addingTimeInterval(
+            -Double(max(0, task.safeZoneMinutes ?? settings.deadlineBufferMinutes)) * 60
+        )
+        let preferredSlots = freeSlots.compactMap { slot -> Interval? in
+            let end = min(slot.end, target)
+            return slot.start < end ? Interval(start: slot.start, end: end) : nil
+        }
+        var preferredFocus = initialFocus
+        let preferred = placeCapacity(task: task, requestedMinutes: requestedMinutes,
+                                      in: preferredSlots, settings: settings,
+                                      minutesPerDay: &preferredFocus)
+        let result: ScheduleResult
+        if scheduledMinuteCount(in: preferred) >= requestedMinutes {
+            result = preferred
+            minutesPerDay = preferredFocus
+        } else {
+            detachBlocks(in: preferred)
+            result = placeCapacity(task: task, requestedMinutes: requestedMinutes,
+                                   in: freeSlots, settings: settings,
+                                   minutesPerDay: &minutesPerDay)
+        }
+        if distribute {
+            switch result {
+            case .success(let blocks), .partialFit(let blocks, _):
+                spread(blocks: blocks, in: freeSlots, task: task,
+                       settings: settings, initialFocus: initialFocus, fixedBlocks: fixedBlocks)
+                minutesPerDay = initialFocus
+                for block in blocks {
+                    for (day, minutes) in minutesByDay(from: block.startTime, to: block.endTime) {
+                        minutesPerDay[day, default: 0] += minutes
+                    }
+                }
+            case .noSlots: break
+            }
+        }
+        return result
+    }
+
+    /// Improve an already feasible plan without changing its block sizes or
+    /// coverage. All other blocks remain reserved while one block moves. The
+    /// original position is always a candidate: fragmented capacity, daily
+    /// limits, and another task's scarce opportunities cannot be sacrificed.
+    private static func spread(
+        blocks: [ScheduledBlock],
+        in freeSlots: [Interval],
+        task: FilumaTask,
+        settings: UserSettings,
+        initialFocus: [Date: Double],
+        fixedBlocks: [ScheduledBlock] = []
+    ) {
+        guard !blocks.isEmpty, let first = freeSlots.map(\.start).min(),
+              let last = freeSlots.map(\.end).max() else { return }
+        let calendar = Calendar.current
+        let safeFinish = task.deadline.addingTimeInterval(
+            -Double(max(0, task.safeZoneMinutes ?? settings.deadlineBufferMinutes)) * 60
+        )
+        let targetFinish = safeFinish > first ? min(safeFinish, last) : last
+        let ordered = blocks.sorted { $0.startTime < $1.startTime }
+        for (index, block) in ordered.enumerated() {
+            let anchor = first.addingTimeInterval(
+                targetFinish.timeIntervalSince(first) * (Double(index) + 0.5) / Double(ordered.count)
+            )
+            let others = blocks.filter { $0.id != block.id }
+            var available = freeSlots
+            subtract(blocks: others, from: &available)
+            var focus = initialFocus
+            for other in others {
+                for (day, minutes) in minutesByDay(from: other.startTime, to: other.endTime) {
+                    focus[day, default: 0] += minutes
+                }
+            }
+            let related = others + fixedBlocks
+            let occupiedDays = Set(related.flatMap {
+                minutesByDay(from: $0.startTime, to: $0.endTime).map { $0.0 }
+            })
+            let duration = TimeInterval(block.durationMinutes * 60)
+            func score(_ date: Date) -> (Int, Int, Int, Double, Date) {
+                let end = date.addingTimeInterval(duration)
+                let days = minutesByDay(from: date, to: end).map { $0.0 }
+                let late = safeFinish > first && end > safeFinish ? 1 : 0
+                let sharedDays = days.filter { occupiedDays.contains($0) }.count
+                let adjacent = related.filter {
+                    abs(date.timeIntervalSince($0.endTime)) < 30 * 60
+                        || abs($0.startTime.timeIntervalSince(end)) < 30 * 60
+                }.count
+                // Target alignment dominates the soft workload tie-breaker.
+                let load = days.reduce(0.0) { $0 + focus[$1, default: 0] } / 60
+                return (late, sharedDays, adjacent, abs(date.timeIntervalSince(anchor)) / 60 + load, date)
+            }
+            var best = block.startTime
+            var bestScore = score(best)
+            for slot in available where slot.durationMinutes >= Double(block.durationMinutes) {
+                // Each local day is an opportunity, including overnight slots.
+                var day = calendar.startOfDay(for: slot.start)
+                while day < slot.end {
+                    guard let nextDay = calendar.date(byAdding: .day, value: 1, to: day) else { break }
+                    let lower = max(slot.start, day)
+                    let upper = min(slot.end.addingTimeInterval(-duration), nextDay.addingTimeInterval(-1))
+                    if lower <= upper {
+                        let nearest = min(max(anchor, lower), upper)
+                        let candidates = [lower, upper, nearest, safeFinish.addingTimeInterval(-duration)]
+                        for candidate in candidates {
+                            // Round down and up: clipping at a deadline should
+                            // not turn the last valid five-minute start invalid.
+                            let floorDate = Date(timeIntervalSinceReferenceDate:
+                                floor(candidate.timeIntervalSinceReferenceDate / 300) * 300)
+                            for date in [floorDate, roundUpToFiveMinutes(candidate)]
+                                where date >= lower && date <= upper {
+                                let end = date.addingTimeInterval(duration)
+                                let fits = settings.dailyFocusMinutes <= 0 || minutesByDay(from: date, to: end).allSatisfy {
+                                    focus[$0.0, default: 0] + $0.1 <= Double(settings.dailyFocusMinutes) + 0.000_001
+                                }
+                                guard fits else { continue }
+                                let candidateScore = score(date)
+                                if candidateScore < bestScore {
+                                    best = date
+                                    bestScore = candidateScore
+                                }
+                            }
+                        }
+                    }
+                    day = nextDay
+                }
+            }
+            block.startTime = best
+        }
+    }
+
     /// Assign chunks to the earliest available slots. Daily focus accounting
     /// follows calendar-day boundaries even when an awake window crosses them.
-    private static func place(
+    private static func placeCapacity(
         task: FilumaTask,
         requestedMinutes: Int,
         in freeSlots: [Interval],

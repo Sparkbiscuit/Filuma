@@ -3,7 +3,7 @@ import SwiftData
 
 // MARK: - Pace (schedule pressure)
 
-/// How much of the free time left before a task's buffered deadline its
+/// How much of the free time left before a task's actual deadline its
 /// remaining effort would consume. The red "Not blocked" state fires when it's
 /// already too late; pace is the early warning, days before that.
 enum PaceLevel {

@@ -1,3 +1,5 @@
+> Historical 1.3.0 material. For the current update, see [1.4.0 submission guide](1.4.0-update-submission.md).
+
 # Filuma — App Store metadata draft
 
 Prepared for iOS 1.3.0 (build 6) on 2026-08-23. Copy is intentionally

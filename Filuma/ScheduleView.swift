@@ -20,6 +20,7 @@ struct ScheduleView: View {
     @Query private var busyEvents: [BusyEvent]
     @Query private var reminders: [Reminder]
     @Query private var settingsArray: [UserSettings]
+    @State private var inspectedTask: FilumaTask?
     @State private var selectedDate = Date()
     @State private var dayStripAnchor = Date()
     @State private var viewMode: ViewMode = .day
@@ -60,6 +61,9 @@ struct ScheduleView: View {
             }
             .hearthScreen(topGlow: 0.26, bottomGlow: 0.32)
             .toolbar(.hidden, for: .navigationBar)
+            .sheet(item: $inspectedTask) { task in
+                TaskPlanPreview(task: task)
+            }
             .fullScreenCover(
                 item: $completionReceipt,
                 onDismiss: presentPendingTaskStatus
@@ -459,6 +463,9 @@ struct ScheduleView: View {
                 .scrollIndicators(.hidden)
                 .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
                 .accessibilityIdentifier("schedule.weekHorizontal")
+
+                weekThreads
+                    .padding(.top, 24)
             }
             .padding(.horizontal, 14)
             .padding(.top, 8)
@@ -466,6 +473,46 @@ struct ScheduleView: View {
         }
         .accessibilityIdentifier("schedule.weekGrid")
         .sensoryFeedback(.selection, trigger: weekOffset)
+    }
+
+    /// Related reservations share one thread, without drawing misleading
+    /// connections between unrelated context-colored calendar events.
+    private var weekThreads: some View {
+        let visibleIDs = Set(allBlocks.filter { block in
+            weekDays.contains { calendar.isDate($0, inSameDayAs: block.startTime) }
+        }.compactMap { $0.task?.id })
+        let tasks = allBlocks.compactMap(\.task).reduce(into: [UUID: FilumaTask]()) {
+            $0[$1.id] = $1
+        }.values.filter { visibleIDs.contains($0.id) && !$0.isComplete }
+            .sorted { $0.deadline == $1.deadline ? $0.id.uuidString < $1.id.uuidString : $0.deadline < $1.deadline }
+        return VStack(alignment: .leading, spacing: 18) {
+            if !tasks.isEmpty {
+                Text("Threads this week")
+                    .font(AppFont.heading(20))
+                    .foregroundStyle(Color.filumaText)
+                ForEach(tasks) { task in
+                    Button {
+                        inspectedTask = task
+                    } label: {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Circle().fill(task.context.color).frame(width: 8, height: 8)
+                                Text(task.title).font(AppFont.bodySemibold(15))
+                                Spacer(minLength: 8)
+                                Image(systemName: "chevron.right").font(.caption)
+                            }
+                            TaskDistributionView(task: task, globalSafeZoneMinutes: settingsArray.first?.deadlineBufferMinutes ?? 1440)
+                        }
+                        .foregroundStyle(Color.filumaText)
+                        .padding(.vertical, 10)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Shows this task's scheduled sessions")
+                    Divider().overlay(Color.filumaBorder)
+                }
+            }
+        }
     }
 
     private var weekNavigationHeader: some View {
@@ -1757,5 +1804,141 @@ private struct BlockProgressPrompt: View {
     private var sliderRange: ClosedRange<Double> {
         let minimum = Double(min(task.progressPercent, 95))
         return minimum...100
+    }
+}
+
+
+/// A truthful miniature of a task's current reservations. Horizontal position
+/// encodes elapsed time; color denotes context, never a different task/day.
+struct TaskDistributionView: View {
+    let task: FilumaTask
+    var globalSafeZoneMinutes: Int = 1440
+    var now: Date = Date()
+
+    private var blocks: [ScheduledBlock] {
+        task.scheduledBlocks.filter { !$0.isComplete && $0.endTime > now }
+            .sorted { $0.startTime < $1.startTime }
+    }
+
+    private var dayCount: Int {
+        Set(blocks.map { Calendar.current.startOfDay(for: $0.startTime) }).count
+    }
+
+    private var coverage: Int {
+        blocks.reduce(0) { total, block in
+            let start = max(now, block.startTime)
+            let end = min(task.deadline, block.endTime)
+            return total + max(0, Int(end.timeIntervalSince(start) / 60))
+        }
+    }
+
+    private var finishLabel: String {
+        guard let finish = blocks.map(\.endTime).max() else { return "No upcoming sessions yet" }
+        if coverage < task.remainingMinutes { return "Some work still needs time" }
+        let safeZone = max(0, task.safeZoneMinutes ?? globalSafeZoneMinutes)
+        if finish > task.deadline { return "A session extends past the deadline" }
+        if safeZone > 0 && finish > task.deadline.addingTimeInterval(-Double(safeZone) * 60) {
+            return "Some work uses your Safe Zone"
+        }
+        let days = Int(task.deadline.timeIntervalSince(finish) / 86400)
+        if days > 0 { return "Planned to finish \(days) \(days == 1 ? "day" : "days") early" }
+        return "Planned before the deadline"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if !blocks.isEmpty {
+                Text(dayCount > 1 ? "Spread across \(dayCount) days" : "Planned on one day")
+                    .font(AppFont.bodySemibold(14))
+                    .foregroundStyle(Color.filumaText)
+                GeometryReader { geometry in
+                    let start = blocks.first!.startTime
+                    let finish = max(task.deadline, blocks.last!.endTime)
+                    let interval = max(1, finish.timeIntervalSince(start))
+                    let width = max(1, geometry.size.width - 12)
+                    Path { path in
+                        path.move(to: CGPoint(x: 6, y: 10))
+                        path.addLine(to: CGPoint(x: width + 6, y: 10))
+                    }
+                    .stroke(task.context.color.opacity(0.35), style: StrokeStyle(lineWidth: 1.5, lineCap: .round))
+                    ForEach(blocks) { block in
+                        Circle()
+                            .fill(task.context.color)
+                            .frame(width: 8, height: 8)
+                            .overlay(Circle().stroke(Color.filumaSurface, lineWidth: 1))
+                            .position(x: 6 + width * block.startTime.timeIntervalSince(start) / interval, y: 10)
+                    }
+                    Circle().stroke(Color.filumaSubtle, lineWidth: 1)
+                        .frame(width: 6, height: 6).position(x: width + 6, y: 10)
+                }
+                .frame(height: 20)
+                .accessibilityHidden(true)
+                HStack {
+                    Text(blocks.first!.startTime, format: .dateTime.month(.abbreviated).day())
+                    Spacer()
+                    Text("Due \(task.deadline.formatted(.dateTime.month(.abbreviated).day()))")
+                }
+                .font(AppFont.caption(11))
+                .foregroundStyle(Color.filumaSubtle)
+            }
+            Text(finishLabel)
+                .font(AppFont.body(13))
+                .foregroundStyle(Color.filumaSubtle)
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+struct TaskPlanPreview: View {
+    let task: FilumaTask
+    @Environment(\.dismiss) private var dismiss
+    @Query private var settings: [UserSettings]
+    @State private var editing = false
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 28) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(task.context.rawValue)
+                            .font(AppFont.caption(13)).foregroundStyle(task.context.displayColor)
+                        Text(task.title).font(AppFont.heading(26)).foregroundStyle(Color.filumaText)
+                        Text("\(CountdownFormatter.effortString(minutes: task.remainingMinutes)) remaining")
+                            .font(AppFont.body(14)).foregroundStyle(Color.filumaSubtle)
+                    }
+                    TaskDistributionView(task: task, globalSafeZoneMinutes: settings.first?.deadlineBufferMinutes ?? 1440)
+                        .padding(20)
+                        .background(Color.filumaSurface, in: RoundedRectangle(cornerRadius: 20))
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text("Upcoming sessions").font(AppFont.heading(19))
+                        ForEach(task.scheduledBlocks.filter { !$0.isComplete && $0.endTime > Date() }.sorted { $0.startTime < $1.startTime }) { block in
+                            HStack(alignment: .top, spacing: 12) {
+                                Circle().fill(task.context.color).frame(width: 8, height: 8).padding(.top, 6)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(block.startTime, format: .dateTime.weekday(.wide).month(.abbreviated).day())
+                                        .font(AppFont.bodySemibold(15))
+                                    Text("\(block.startTime.formatted(date: .omitted, time: .shortened)) – \(block.endTime.formatted(date: .omitted, time: .shortened))")
+                                        .font(AppFont.body(14)).foregroundStyle(Color.filumaSubtle)
+                                }
+                                Spacer(minLength: 0)
+                                if block.isLocked { Image(systemName: "lock").accessibilityLabel("Locked") }
+                            }
+                            Divider()
+                        }
+                    }.foregroundStyle(Color.filumaText)
+                }
+                .padding(24)
+                .frame(maxWidth: 680)
+                .frame(maxWidth: .infinity)
+            }
+            .hearthScreen(topGlow: 0.12, bottomGlow: 0.08)
+            .navigationTitle("Task Preview")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .primaryAction) { Button("Edit") { editing = true } }
+            }
+            .sheet(isPresented: $editing) { TaskEditView(task: task) }
+        }
     }
 }

@@ -20,6 +20,8 @@ struct CaptureSheetView: View {
     @State private var title = ""
     @State private var firstStep = ""
     @State private var deadline = defaultDeadline()
+    @Query private var settingsRows: [UserSettings]
+    @State private var safeZoneMinutes: Int? = nil
     @State private var effortMinutes = 60
     @State private var context: TaskContext = .school
     @State private var customEffort = 180
@@ -113,7 +115,7 @@ struct CaptureSheetView: View {
     }
 
     private var hasMeaningfulDraft: Bool {
-        !trimmedTitle.isEmpty
+        safeZoneMinutes != nil || !trimmedTitle.isEmpty
             || !firstStep.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
@@ -1114,14 +1116,15 @@ struct CaptureSheetView: View {
             .accessibilityValue(showSchedulingOptions ? "Expanded" : "Collapsed")
             .accessibilityHint(
                 showSchedulingOptions
-                    ? "Hides repeat and earliest start controls"
-                    : "Shows repeat and earliest start controls"
+                    ? "Hides Safe Zone, repeat and earliest start controls"
+                    : "Shows Safe Zone, repeat and earliest start controls"
             )
 
             if showSchedulingOptions {
                 VStack(alignment: .leading, spacing: 20) {
                     Divider()
                         .overlay(Color.filumaBorder)
+                    SafeZonePicker(minutes: $safeZoneMinutes, globalDefault: settingsRows.first?.deadlineBufferMinutes ?? 1440)
                     repeatPicker
                     startPicker
                 }
@@ -1144,6 +1147,7 @@ struct CaptureSheetView: View {
 
     private var schedulingOptionsSummary: String? {
         var choices: [String] = []
+        if let safeZoneMinutes { choices.append("Safe Zone: \(SafeZonePicker.label(for: safeZoneMinutes))") }
         if repeatWeekly { choices.append("Weekly") }
         if useCustomStart { choices.append("Starts later") }
         return choices.isEmpty ? nil : choices.joined(separator: " · ")
@@ -1256,6 +1260,7 @@ struct CaptureSheetView: View {
                 taskContext: context,
                 deadline: deadline,
                 effortMinutes: effortMinutes,
+                safeZoneMinutes: safeZoneMinutes,
                 preferredStart: useCustomStart ? customStart : nil,
                 context: modelContext
             )

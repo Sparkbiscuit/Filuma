@@ -197,6 +197,169 @@ Terms of Use (Apple Standard EULA): https://www.apple.com/legal/internet-service
   existing users bypass it, and first-time users can choose âStart with
   defaultsâ without opening the schedule editors.
 
+## Known issues after 1.4.0 (logged 2026-09-16)
+
+Found in a read-only review on 2026-09-16; nothing here has been fixed yet.
+Filuma is maintenance-only, so these are bug fixes for the next update, not new
+features.
+
+### High
+
+- [ ] **Google Calendar import window never advances after the first sync.**
+      `Filuma/GoogleCalendarService.swift:228` does a full fetch only when
+      `googleSyncToken` is nil, and `fetchEvents` (`:1014-1025`) sends the
+      30-day `timeMin`/`timeMax` window only on that full fetch. Later syncs
+      send the token and get back only changed events. The token is cleared
+      only on connect, import on/off, disconnect, Pro lapse, or an HTTP 410.
+      Failure: an event that was more than 30 days out at connect time and is
+      never edited is never imported, and with `singleEvents=true` that
+      includes every instance of a weekly recurring event. About a month after
+      connecting, Filuma schedules and exports work blocks on top of real
+      commitments. Fix: force a full window fetch (token nil,
+      `fullSync = true`) when the last full sync is more than about 24 hours
+      old, keeping that timestamp in App Group `UserDefaults` to avoid a schema
+      change; or always do the 30-day full fetch on foreground (1-3 pages, and
+      `reconcileImport` already drops orphans on a full sync). Add a test that
+      an event outside the first window is imported once the window moves
+      forward. Effort: S.
+
+### Medium
+
+- [ ] **Busy-time import covers 30 days, but 1.4 spreads sessions across the
+      whole deadline window.** `Filuma/CalendarImportService.swift:46` sets
+      `horizonDays = 30` (Google shares it at
+      `Filuma/GoogleCalendarService.swift:18`), export runs 60 days out
+      (`Filuma/CalendarExportService.swift:36`), and `spread()` aims later
+      sessions toward the Safe Zone finish
+      (`Filuma/SchedulerService.swift:1081-1089`). Deadline pickers have no
+      upper limit and the Siri intent allows 60 days
+      (`Filuma/FilumaIntents.swift:21`). Failure: a task due in six weeks gets
+      sessions in weeks 5-6, where Filuma has no calendar data. They land on
+      real events, get exported, and are only repaired, by rescheduling the
+      whole task, once those events enter the 30-day window. Fix: raise the
+      import horizon to at least the export horizon (60 days), or to the latest
+      active deadline capped at about 120 days. Alternative: when any import is
+      on, clamp `targetFinish` to now plus the import horizon. Add a scheduler
+      test with a busy event past day 30. Effort: S.
+- [ ] **A full-plan rebuild moves every other task's spread sessions later.**
+      `rebalance` (`Filuma/SchedulerService.swift:313-321`) deletes and
+      recreates every active task's unlocked blocks, and `spread()`
+      (`:1087-1089`) targets each session from `first`, the earliest free slot,
+      which starts at now plus the start buffer (`:323-325`). Rebuilds run
+      whenever any block ends unchecked (`catchUpMissedBlocks`), on every
+      capture (`Filuma/PlanCoordinator.swift:359`), and on settings changes
+      (`:1711`, `:1811`). Failure: one missed block shifts unrelated tasks'
+      future sessions. In a simplified Python port of `spread()` (no busy time),
+      a four-session task due in nine days moved by 1h45, 1h15, 45m and 15m
+      when rebuilt two hours later, so a "Thursday 2:00" session keeps drifting
+      and its notification and exported event are rebuilt each time. Not yet
+      reproduced in the app. The only stability test
+      (`FilumaTests/FilumaTests.swift:652`) covers the unchanged case. Fix:
+      first add a failing test (task A has a missed block; after
+      `catchUpMissedBlocks` runs later, task B's future start times are
+      unchanged). Then either have `rebalance` hand each deleted block's old
+      start to `spread()` and keep it when still free and on time, or compute
+      `first` from a stable origin such as start of today instead of `now`.
+      Effort: M.
+- [ ] **Help & Support does not lead to Filuma help.** The in-app link
+      (`Filuma/SettingsView.swift:1321`) and the App Store support URL both
+      point to `https://sparkbiscuit.me/`, which has no Filuma help;
+      `/filuma/support/` returns 404 and the homepage's only contact is a small
+      email link. Failure: a Pro subscriber looking for help with the
+      subscription, calendars, or export finds nothing about Filuma. Fix: the
+      site-side support page is tracked in the sparkbiscuit.me notes. In the
+      next update, move this link to a dedicated Filuma support URL once it is
+      live, and switch the App Store Support URL in the same submission.
+      Effort: S.
+
+### Low
+
+- [ ] **A Pro lapse switches off all four calendar integration settings for
+      good.** `ProFeatureSuspension.reconcileFreeTier`
+      (`Filuma/FilumaPro.swift:463-471`) sets Apple and Google import and
+      export to false and clears the sync token whenever the entitlement
+      becomes free (`Filuma/FilumaApp.swift:747`). Import and export are
+      already gated on `FilumaProAccess.isPro` at runtime. Failure: a
+      subscriber whose renewal fails and who later re-subscribes finds every
+      integration off, with no notice, and has to re-enable each one. Stopping
+      integrations on lapse is intentional (doc comment at `:441-445`); only
+      the lost toggles are the problem. Fix: delete only the imported
+      busy-event copies (and optionally the token), leave the four settings
+      alone, and rely on the existing `isPro` checks. Add a Pro, free, Pro test
+      that the settings survive. Effort: S.
+- [ ] **Calendar import counts Free and declined events as busy.** Apple import
+      drops all-day events but checks neither availability nor the user's
+      response (`Filuma/CalendarImportService.swift:84`). Google's `GEvent`
+      (`Filuma/GoogleCalendarService.swift:120-126`) doesn't decode
+      transparency or attendees, and `reconcileImport` skips only cancelled,
+      all-day, and Filuma-tagged events. Failure: any declined meeting, or any
+      event marked Free, blocks scheduler time, so work is pushed off open time
+      or reported as no longer fitting. Fix: for Apple, also skip
+      `availability == .free` and events the current user declined; for Google,
+      decode `transparency` and `attendees[].self`/`responseStatus` and skip
+      transparent or self-declined events. Add a `reconcileImport` test for
+      each. Effort: S.
+- [ ] **Notification triggers carry no time zone.** Block-start and heads-up
+      triggers (`Filuma/BlockNotificationService.swift:508-512`), digests
+      (`:444-448`), and reminders (`Filuma/NotificationService.swift:51-55`)
+      build `[.year, .month, .day, .hour, .minute]` without `.timeZone`, and
+      nothing in the app observes time-zone changes. Failure: the triggers are
+      floating wall-clock times, so a student who flies from Eastern to Central
+      without opening Filuma gets the block-start alert an hour after the block
+      began, until the next foreground rebuild. This follows from the API and
+      has not been seen on a device. Fix: add `.timeZone` to the components for
+      block starts and heads-ups (or use `UNTimeIntervalNotificationTrigger`),
+      and optionally rebuild on
+      `UIApplication.significantTimeChangeNotification`. Effort: S.
+- [ ] **README doesn't mention Filuma Pro and describes an outdated Weave.**
+      The case study's Source link points to the public repo. `README.md:47`
+      says the Weave shows "your last two weeks", and the README never mentions
+      Filuma Pro, the free tier, or the optional Google Calendar connection.
+      Failure: readers get an inaccurate picture of 1.4, where calendar
+      integrations, widgets, weekly repeats, and the Weave are Pro-only and the
+      Weave offers Week, 2 Weeks, and Month (`Filuma/WeaveView.swift:148-152`).
+      Fix: add a short Free and Pro paragraph that matches the sparkbiscuit.me
+      copy (free for up to three active tasks, Pro for more), change the Weave
+      line to "a week, two weeks, or a month", and mention Google Calendar.
+      Effort: S.
+- [ ] **Paywall copy undersells the Weave and implies a free partial one.**
+      `Filuma/FilumaPro.swift:313` lists "Your full two-week Weave", and the
+      `.weave` message at `:149` says "the last two weeks". The app offers
+      Week, 2 Weeks, and Month, and `Filuma/FilumaApp.swift:578-584` locks the
+      whole Weave tab for free users. Failure: the benefit list App Review
+      reads leaves out the Month view, and "full" suggests free users get part
+      of the Weave. Fix, in the same copy pass as the README with no layout
+      change: make the benefit "The Weave: a week, two weeks, or a month" and
+      start the `.weave` message with "See your recent weeks of". Effort: S.
+- [ ] **Tests don't cover plan stability after a missed block, busy time past
+      the import window, or DST, and they depend on the real clock.**
+      `FilumaTests/FilumaTests.swift:9` uses `Calendar.current`, and the anchor
+      at `:29-32` is 9:00 tomorrow from `Date()`, with deadlines added in
+      hours. No test mentions time zones or DST, and the only distribution
+      stability test (`:652`) covers the unchanged case. Google sync-token
+      handling is otherwise well tested in
+      `FilumaTests/GoogleCalendarTests.swift`; only window staleness is
+      missing. Failure: a run in a DST week (next US change 2026-11-01) tests
+      different wall-clock geometry, and the three scheduling and import bugs
+      above have no regression coverage. Fix: give scheduler tests a fixed
+      Gregorian calendar, time zone (e.g. `America/New_York`), and reference
+      date. Add tests that a missed block leaves other tasks unchanged, that
+      busy time past day 30 is respected, that a week crossing DST places
+      blocks correctly, and that a stale Google window forces a full fetch.
+      Most of this lands with the fixes above. Effort: M.
+- [ ] **Task-plan preview force-unwraps its block list (needs a device
+      check).** `TaskDistributionView` uses `blocks.first!` and `blocks.last!`
+      inside a `GeometryReader` (`Filuma/ScheduleView.swift:1855-1856`) and
+      again at `:1877`, while `blocks` re-reads `task.scheduledBlocks` on every
+      access and the `!blocks.isEmpty` check is at `:1850`. Failure (not
+      reproduced): if completing, deleting, or replanning the task removes its
+      blocks between that check and a later layout pass, for example during a
+      removal transition, the unwrap traps. SwiftUI normally re-evaluates the
+      `if` first and `now` is fixed at init, so this may not be reachable. Fix:
+      read `let blocks = self.blocks` once in `body` and use
+      `guard let first = blocks.first, let last = blocks.last` instead of force
+      unwraps. Effort: S.
+
 ## Follow-ups worth considering (not release-gating)
 
 - Digest notifications (morning preview / evening wrap-up) default ON behind
@@ -212,6 +375,10 @@ Terms of Use (Apple Standard EULA): https://www.apple.com/legal/internet-service
   schema, including the inline-default `planningRebuildPending` field. Current
   tests comprehensively exercise the live schema but do not yet prove an
   upgrade from a historical store file.
+- Listen for `EKEventStoreChanged` so the Apple Calendar busy-time copy
+  refreshes while the app stays open.
+- Use SwiftUI's `manageSubscriptionsSheet` instead of opening the
+  `apps.apple.com/account/subscriptions` URL from Settings.
 
 ## Frozen verification artifacts â 2026-08-23
 
